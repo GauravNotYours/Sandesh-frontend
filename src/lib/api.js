@@ -1,4 +1,17 @@
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3001'
+function normalizeBaseUrl(value) {
+  return value ? value.replace(/\/+$/, '') : ''
+}
+
+function getApiBase() {
+  const envBase = normalizeBaseUrl(import.meta.env.VITE_API_BASE)
+  if (envBase) return envBase
+
+  if (import.meta.env.DEV) return 'http://localhost:3001'
+
+  return normalizeBaseUrl(window.location.origin)
+}
+
+export const API_BASE = getApiBase()
 
 export async function apiFetch(path, { method = 'GET', token, body } = {}) {
   const headers = {}

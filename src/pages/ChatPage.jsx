@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../state/AuthContext.jsx'
-import { apiFetch } from '../lib/api.js'
+import { API_BASE, apiFetch } from '../lib/api.js'
 import MessageBubble from '../components/MessageBubble.jsx'
 import { io } from 'socket.io-client'
 
@@ -72,7 +72,6 @@ export default function ChatPage() {
       }
     })()
 
-    const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3001'
     const socket = io(API_BASE, {
       auth: { token },
       transports: ['websocket'],
