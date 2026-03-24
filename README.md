@@ -3,7 +3,7 @@
 Dark-mode chat UI with:
 - Login (`/login`)
 - Chat (`/chat`)
-- Admin panel (`/admin`) for admin users (seeded as `Viparyas`)
+- Admin panel (`/admin`) for admin users
 - Banned page (`/banned`)
 
 ## Local run

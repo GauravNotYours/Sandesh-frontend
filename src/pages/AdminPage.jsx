@@ -260,7 +260,7 @@ export default function AdminPage() {
                 <label>Role</label>
                 <select value={newRole} onChange={(e) => setNewRole(e.target.value)}>
                   <option value="user">User</option>
-                  <option value="admin">Admin (Viparyas only)</option>
+                  <option value="admin">Admin</option>
                 </select>
               </div>
               <button className="primaryBtn" onClick={onCreateUser} disabled={loading}>
