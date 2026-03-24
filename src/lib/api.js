@@ -2,23 +2,45 @@ function normalizeBaseUrl(value) {
   return value ? value.replace(/\/+$/, '') : ''
 }
 
+function isLocalHost(hostname) {
+  return hostname === 'localhost' || hostname === '127.0.0.1'
+}
+
 function getApiBase() {
   const envBase = normalizeBaseUrl(import.meta.env.VITE_API_BASE)
   if (envBase) return envBase
 
   if (import.meta.env.DEV) return 'http://localhost:3001'
 
-  return normalizeBaseUrl(window.location.origin)
+  // In production, only fall back to same-origin when the app is being served
+  // from a local machine. Hosted frontends should set VITE_API_BASE explicitly.
+  if (typeof window !== 'undefined' && isLocalHost(window.location.hostname)) {
+    return normalizeBaseUrl(window.location.origin)
+  }
+
+  return ''
 }
 
 export const API_BASE = getApiBase()
+const MISSING_API_BASE_MESSAGE =
+  'Missing VITE_API_BASE for production. Set it to your deployed backend URL before building the frontend.'
+
+function getRequestUrl(path) {
+  if (API_BASE) return `${API_BASE}${path}`
+
+  if (import.meta.env.PROD) {
+    throw new Error(MISSING_API_BASE_MESSAGE)
+  }
+
+  return path
+}
 
 export async function apiFetch(path, { method = 'GET', token, body } = {}) {
   const headers = {}
   if (token) headers.Authorization = `Bearer ${token}`
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(getRequestUrl(path), {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,

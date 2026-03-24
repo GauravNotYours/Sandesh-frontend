@@ -19,5 +19,6 @@ Dark-mode chat UI with:
 
 - `chat` page updates in real time using WebSockets (`socket.io`).
 - For Vercel or other hosted deployments, set `VITE_API_BASE` to your deployed backend URL, for example `https://your-backend.onrender.com`.
-- If `VITE_API_BASE` is not set, the frontend uses `http://localhost:3001` in local development and the current site origin in production.
+- If `VITE_API_BASE` is not set, the frontend uses `http://localhost:3001` in local development.
+- In production, `VITE_API_BASE` should always be set unless your API is intentionally served from the same local origin.
 - Because this is a SPA, configure Vercel rewrites so `/login`, `/chat`, `/admin`, `/banned` route to `index.html`.

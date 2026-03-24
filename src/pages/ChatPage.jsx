@@ -5,6 +5,9 @@ import { API_BASE, apiFetch } from '../lib/api.js'
 import MessageBubble from '../components/MessageBubble.jsx'
 import { io } from 'socket.io-client'
 
+const MISSING_SOCKET_API_BASE_MESSAGE =
+  'Missing VITE_API_BASE for production. Set it to your deployed backend URL before building the frontend.'
+
 export default function ChatPage() {
   const navigate = useNavigate()
   const { token, user, banned, logout, handleAuthError, refreshMe } = useAuth()
@@ -71,6 +74,13 @@ export default function ChatPage() {
         if (!handleAuthError(err)) setError(err?.message || 'Failed to load messages')
       }
     })()
+
+    if (!API_BASE && import.meta.env.PROD) {
+      setError(MISSING_SOCKET_API_BASE_MESSAGE)
+      return () => {
+        alive = false
+      }
+    }
 
     const socket = io(API_BASE, {
       auth: { token },
