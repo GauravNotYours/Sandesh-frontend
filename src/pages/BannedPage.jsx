@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { useAuth } from '../state/AuthContext.jsx'
+import { useAuth } from '../state/useAuth.js'
 
 export default function BannedPage() {
   const navigate = useNavigate()

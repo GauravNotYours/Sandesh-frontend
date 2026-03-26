@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
-import AuthProvider, { useAuth } from './state/AuthContext.jsx'
+import AuthProvider from './state/AuthContext.jsx'
+import { useAuth } from './state/useAuth.js'
 
 import LoginPage from './pages/LoginPage.jsx'
 import ChatPage from './pages/ChatPage.jsx'

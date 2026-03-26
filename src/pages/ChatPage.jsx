@@ -1,12 +1,62 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useAuth } from '../state/AuthContext.jsx'
+import { useAuth } from '../state/useAuth.js'
 import { API_BASE, apiFetch } from '../lib/api.js'
 import MessageBubble from '../components/MessageBubble.jsx'
 import { io } from 'socket.io-client'
 
 const MISSING_SOCKET_API_BASE_MESSAGE =
   'Missing VITE_API_BASE for production. Set it to your deployed backend URL before building the frontend.'
+const MESSAGE_LIMIT = 100
+const POLL_INTERVAL_MS = 3000
+
+function toTimestamp(value) {
+  const ms = new Date(value || 0).getTime()
+  return Number.isFinite(ms) ? ms : 0
+}
+
+function mergeMessages(existing, incoming) {
+  const merged = new Map(existing.map((message) => [message.id, message]))
+
+  for (const message of incoming || []) {
+    if (!message?.id) continue
+
+    const previous = merged.get(message.id)
+    merged.set(message.id, previous ? { ...previous, ...message } : message)
+  }
+
+  return Array.from(merged.values())
+    .sort((a, b) => toTimestamp(a.createdAt) - toTimestamp(b.createdAt))
+    .slice(-MESSAGE_LIMIT)
+}
+
+function getLatestChangeCursor(messages) {
+  return messages.reduce((latest, message) => {
+    const createdAt = toTimestamp(message.createdAt)
+    const deletedAt = toTimestamp(message.deletedAt)
+    return Math.max(latest, createdAt, deletedAt)
+  }, 0)
+}
+
+function getSocketAuthError(err) {
+  const message = String(err?.message || '').trim()
+  const lowered = message.toLowerCase()
+
+  if (!message) return null
+  if (lowered.includes('banned')) {
+    return { status: 403, code: 'BANNED', message }
+  }
+  if (
+    lowered.includes('missing token') ||
+    lowered.includes('invalid token') ||
+    lowered.includes('user not found') ||
+    lowered.includes('unauthorized')
+  ) {
+    return { status: 401, message }
+  }
+
+  return null
+}
 
 export default function ChatPage() {
   const navigate = useNavigate()
@@ -16,10 +66,12 @@ export default function ChatPage() {
   const [text, setText] = useState('')
   const [replyTo, setReplyTo] = useState(null)
   const [error, setError] = useState('')
+  const [realtimeMode, setRealtimeMode] = useState('polling')
 
   const messagesRef = useRef(null)
   const messagesEndRef = useRef(null)
   const socketRef = useRef(null)
+  const latestCursorRef = useRef(0)
 
   useLayoutEffect(() => {
     const endEl = messagesEndRef.current
@@ -30,35 +82,47 @@ export default function ChatPage() {
     })
   }, [messages])
 
+  useEffect(() => {
+    latestCursorRef.current = getLatestChangeCursor(messages)
+  }, [messages])
+
   function applyDeletedMessage(payload) {
     if (!payload?.id) return
     setMessages((prev) =>
-      prev.map((m) =>
-        m.id === payload.id
-          ? {
-              ...m,
-              isDeleted: true,
-              deletedAt: payload.deletedAt || m.deletedAt || null,
-              senderUsername: payload.senderUsername || m.senderUsername,
-              text: '',
-            }
-          : m,
-      ),
+      mergeMessages(prev, [
+        {
+          id: payload.id,
+          isDeleted: true,
+          deletedAt: payload.deletedAt || null,
+          senderUsername: payload.senderUsername || null,
+          text: '',
+        },
+      ]),
     )
     setReplyTo((prev) => (prev?.id === payload.id ? null : prev))
   }
 
-  async function fetchMessages({ sinceMs } = {}) {
+  function applyIncomingMessages(incoming) {
+    if (!incoming?.length) return
+
+    setMessages((prev) => mergeMessages(prev, incoming))
+    const deletedIds = new Set(incoming.filter((message) => message?.isDeleted).map((message) => message.id))
+    if (deletedIds.size) {
+      setReplyTo((prev) => (prev?.id && deletedIds.has(prev.id) ? null : prev))
+    }
+  }
+
+  const fetchMessages = useCallback(async ({ sinceMs } = {}) => {
     const qs = sinceMs ? `?since=${sinceMs}` : ''
     const res = await apiFetch(`/api/chat/messages${qs}`, { token })
     return res.messages || []
-  }
+  }, [token])
 
-  async function reloadInitial() {
+  const reloadInitial = useCallback(async () => {
     setError('')
     const list = await fetchMessages({})
     setMessages(list)
-  }
+  }, [fetchMessages])
 
   useEffect(() => {
     if (!token) return
@@ -76,7 +140,16 @@ export default function ChatPage() {
     })()
 
     if (!API_BASE && import.meta.env.PROD) {
+      setRealtimeMode('polling')
       setError(MISSING_SOCKET_API_BASE_MESSAGE)
+      return () => {
+        alive = false
+      }
+    }
+
+    setRealtimeMode(API_BASE ? 'websocket' : 'polling')
+
+    if (!API_BASE) {
       return () => {
         alive = false
       }
@@ -85,34 +158,48 @@ export default function ChatPage() {
     const socket = io(API_BASE, {
       auth: { token },
       transports: ['websocket'],
+      reconnectionAttempts: 2,
+      timeout: 5000,
     })
 
     socketRef.current = socket
 
+    socket.on('connect', () => {
+      if (!alive) return
+      setRealtimeMode('websocket')
+    })
+
     socket.on('chat:newMessage', (m) => {
-      setMessages((prev) => {
-        if (prev.some((x) => x.id === m.id)) return prev
-        const merged = prev.concat([m])
-        const trimmed = merged.length > 100 ? merged.slice(merged.length - 100) : merged
-        return trimmed
-      })
+      applyIncomingMessages([m])
     })
 
     socket.on('chat:deleted', (payload) => {
       applyDeletedMessage(payload)
     })
 
-    socket.on('connect_error', async (err) => {
-      const msg = String(err?.message || err || '')
-      const isBanned = msg.toLowerCase().includes('banned') || String(err?.code) === 'BANNED'
-      const fake = { status: isBanned ? 403 : 401, code: isBanned ? 'BANNED' : undefined, message: msg }
-      if (!handleAuthError(fake)) setError(msg || 'Socket connection failed')
-      if (isBanned) {
-        navigate('/banned', { replace: true })
+    socket.on('connect_error', (err) => {
+      if (!alive) return
+
+      const authError = getSocketAuthError(err)
+      if (authError && handleAuthError(authError)) {
+        if (authError.code === 'BANNED') {
+          navigate('/banned', { replace: true })
+        }
+        return
       }
+
+      setRealtimeMode('polling')
+      socket.disconnect()
+      socketRef.current = null
     })
 
-    socket.on('disconnect', async () => {
+    socket.on('disconnect', async (reason) => {
+      if (!alive) return
+
+      if (reason !== 'io client disconnect') {
+        setRealtimeMode('polling')
+      }
+
       // If the user gets banned while connected, refresh `/me` to show the banned page.
       try {
         await refreshMe(token)
@@ -126,8 +213,38 @@ export default function ChatPage() {
       socket.disconnect()
       socketRef.current = null
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, banned])
+  }, [token, banned, handleAuthError, navigate, refreshMe, reloadInitial])
+
+  useEffect(() => {
+    if (!token || banned || realtimeMode !== 'polling') return
+
+    let cancelled = false
+    let inFlight = false
+
+    async function poll() {
+      if (cancelled || inFlight) return
+      inFlight = true
+
+      try {
+        const incoming = await fetchMessages({ sinceMs: latestCursorRef.current })
+        if (!cancelled) applyIncomingMessages(incoming)
+      } catch (err) {
+        if (!cancelled && !handleAuthError(err)) {
+          setError(err?.message || 'Failed to sync messages')
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+
+    poll()
+    const timer = window.setInterval(poll, POLL_INTERVAL_MS)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [token, banned, realtimeMode, handleAuthError, fetchMessages])
 
   async function deleteMessage(message) {
     if (!message?.id) return
@@ -201,11 +318,7 @@ export default function ChatPage() {
       setReplyTo(null)
 
       const created = res.message
-      setMessages((prev) => {
-        const merged = prev.concat([created])
-        const trimmedList = merged.length > 100 ? merged.slice(merged.length - 100) : merged
-        return trimmedList
-      })
+      applyIncomingMessages([created])
     } catch (err) {
       if (!handleAuthError(err)) setError(err?.message || 'Failed to send')
     }
@@ -224,7 +337,13 @@ export default function ChatPage() {
           <div className="chatHeaderActions">
             <div className="chatHeaderUserPill">
               <span className="chatHeaderUserDot" />
-              <span>{user?.role === 'admin' ? 'Admin session' : 'Live now'}</span>
+              <span>
+                {user?.role === 'admin'
+                  ? 'Admin session'
+                  : realtimeMode === 'websocket'
+                    ? 'Live now'
+                    : 'Synced every 3s'}
+              </span>
             </div>
             <button
               className="ghostBtn"

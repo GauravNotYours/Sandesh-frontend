@@ -1,5 +1,12 @@
 function normalizeBaseUrl(value) {
-  return value ? value.replace(/\/+$/, '') : ''
+  if (!value) return ''
+
+  const normalized = String(value).trim().replace(/\/+$/, '')
+
+  // People often set VITE_API_BASE to `https://host/api` on Vercel.
+  // The app already prefixes request paths with `/api`, so strip a trailing
+  // `/api` segment here to avoid double-prefix 404s.
+  return normalized.replace(/\/api$/i, '')
 }
 
 function isLocalHost(hostname) {
