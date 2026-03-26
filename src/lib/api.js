@@ -44,7 +44,6 @@ export async function apiFetch(path, { method = 'GET', token, body } = {}) {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
-    cache: 'no-store',
   })
 
   const text = await res.text()
