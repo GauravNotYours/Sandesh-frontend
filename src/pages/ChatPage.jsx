@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { startTransition, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../state/useAuth.js'
 import { API_BASE, apiFetch } from '../lib/api.js'
@@ -9,10 +9,45 @@ const MISSING_SOCKET_API_BASE_MESSAGE =
   'Missing VITE_API_BASE for production. Set it to your deployed backend URL before building the frontend.'
 const MESSAGE_LIMIT = 100
 const POLL_INTERVAL_MS = 3000
+const SCROLL_BOTTOM_THRESHOLD_PX = 120
 
 function toTimestamp(value) {
   const ms = new Date(value || 0).getTime()
   return Number.isFinite(ms) ? ms : 0
+}
+
+function isNearBottom(container) {
+  if (!container) return true
+
+  return (
+    container.scrollHeight - container.scrollTop - container.clientHeight <=
+    SCROLL_BOTTOM_THRESHOLD_PX
+  )
+}
+
+function createClientRequestId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+
+  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function buildOptimisticMessage({ clientRequestId, text, user, replyTo }) {
+  return {
+    id: `pending-${clientRequestId}`,
+    clientRequestId,
+    text,
+    senderId: user?.id || null,
+    senderUsername: user?.username || 'You',
+    isDeleted: false,
+    deletedAt: null,
+    replyToMessageId: replyTo?.id || null,
+    replyToText: replyTo?.text ? String(replyTo.text).slice(0, 160) : null,
+    replyToSenderUsername: replyTo?.senderUsername || null,
+    createdAt: new Date().toISOString(),
+    pending: true,
+  }
 }
 
 function mergeMessages(existing, incoming) {
@@ -21,8 +56,20 @@ function mergeMessages(existing, incoming) {
   for (const message of incoming || []) {
     if (!message?.id) continue
 
+    if (message.clientRequestId) {
+      for (const [id, candidate] of merged.entries()) {
+        if (candidate?.clientRequestId === message.clientRequestId && id !== message.id) {
+          merged.delete(id)
+        }
+      }
+    }
+
     const previous = merged.get(message.id)
-    merged.set(message.id, previous ? { ...previous, ...message } : message)
+    merged.set(message.id, {
+      ...previous,
+      ...message,
+      pending: message.pending ?? false,
+    })
   }
 
   return Array.from(merged.values())
@@ -70,15 +117,31 @@ export default function ChatPage() {
 
   const messagesRef = useRef(null)
   const messagesEndRef = useRef(null)
+  const composerRef = useRef(null)
   const socketRef = useRef(null)
   const latestCursorRef = useRef(0)
+  const shouldStickToBottomRef = useRef(true)
+  const forceScrollRef = useRef(true)
+
+  useLayoutEffect(() => {
+    const input = composerRef.current
+    if (!input) return
+
+    input.style.height = '0px'
+    input.style.height = `${Math.min(input.scrollHeight, 132)}px`
+  }, [text])
 
   useLayoutEffect(() => {
     const endEl = messagesEndRef.current
-    if (!endEl) return
+    if (!endEl || !messages.length) return
+    if (!forceScrollRef.current && !shouldStickToBottomRef.current) return
+
+    const behavior = forceScrollRef.current ? 'smooth' : 'auto'
 
     requestAnimationFrame(() => {
-      endEl.scrollIntoView({ block: 'end' })
+      endEl.scrollIntoView({ block: 'end', behavior })
+      shouldStickToBottomRef.current = true
+      forceScrollRef.current = false
     })
   }, [messages])
 
@@ -86,47 +149,85 @@ export default function ChatPage() {
     latestCursorRef.current = getLatestChangeCursor(messages)
   }, [messages])
 
-  function applyDeletedMessage(payload) {
+  useEffect(() => {
+    shouldStickToBottomRef.current = isNearBottom(messagesRef.current)
+  }, [])
+
+  const handleMessagesScroll = useCallback(() => {
+    shouldStickToBottomRef.current = isNearBottom(messagesRef.current)
+  }, [])
+
+  const applyDeletedMessage = useCallback((payload) => {
     if (!payload?.id) return
-    setMessages((prev) =>
-      mergeMessages(prev, [
-        {
-          id: payload.id,
-          isDeleted: true,
-          deletedAt: payload.deletedAt || null,
-          senderUsername: payload.senderUsername || null,
-          text: '',
-        },
-      ]),
-    )
+
+    startTransition(() => {
+      setMessages((prev) =>
+        mergeMessages(prev, [
+          {
+            id: payload.id,
+            isDeleted: true,
+            deletedAt: payload.deletedAt || null,
+            senderUsername: payload.senderUsername || null,
+            text: '',
+          },
+        ]),
+      )
+    })
+
     setReplyTo((prev) => (prev?.id === payload.id ? null : prev))
-  }
+  }, [])
 
-  function applyIncomingMessages(incoming) {
+  const applyIncomingMessages = useCallback((incoming, { forceScroll = false } = {}) => {
     if (!incoming?.length) return
+    if (forceScroll) forceScrollRef.current = true
 
-    setMessages((prev) => mergeMessages(prev, incoming))
-    const deletedIds = new Set(incoming.filter((message) => message?.isDeleted).map((message) => message.id))
+    startTransition(() => {
+      setMessages((prev) => mergeMessages(prev, incoming))
+    })
+
+    const deletedIds = new Set(
+      incoming.filter((message) => message?.isDeleted).map((message) => message.id),
+    )
     if (deletedIds.size) {
       setReplyTo((prev) => (prev?.id && deletedIds.has(prev.id) ? null : prev))
     }
-  }
+  }, [])
 
-  const fetchMessages = useCallback(async ({ sinceMs } = {}) => {
-    const qs = sinceMs ? `?since=${sinceMs}` : ''
-    const res = await apiFetch(`/api/chat/messages${qs}`, { token })
-    return res.messages || []
-  }, [token])
+  const removePendingMessage = useCallback((clientRequestId) => {
+    if (!clientRequestId) return
+
+    startTransition(() => {
+      setMessages((prev) =>
+        prev.filter((message) => message.clientRequestId !== clientRequestId),
+      )
+    })
+  }, [])
+
+  const restoreComposerOnFailure = useCallback((originalText, originalReplyTo) => {
+    setText((prev) => (prev ? prev : originalText))
+    setReplyTo((prev) => prev ?? originalReplyTo)
+  }, [])
+
+  const fetchMessages = useCallback(
+    async ({ sinceMs } = {}) => {
+      const qs = sinceMs ? `?since=${sinceMs}` : ''
+      const res = await apiFetch(`/api/chat/messages${qs}`, { token })
+      return res.messages || []
+    },
+    [token],
+  )
 
   const reloadInitial = useCallback(async () => {
     setError('')
     const list = await fetchMessages({})
-    setMessages(list)
+    forceScrollRef.current = true
+    startTransition(() => {
+      setMessages(list)
+    })
   }, [fetchMessages])
 
   useEffect(() => {
-    if (!token) return
-    if (banned) return
+    if (!token || banned) return undefined
 
     let alive = true
 
@@ -169,8 +270,8 @@ export default function ChatPage() {
       setRealtimeMode('websocket')
     })
 
-    socket.on('chat:newMessage', (m) => {
-      applyIncomingMessages([m])
+    socket.on('chat:newMessage', (message) => {
+      applyIncomingMessages([message])
     })
 
     socket.on('chat:deleted', (payload) => {
@@ -200,7 +301,6 @@ export default function ChatPage() {
         setRealtimeMode('polling')
       }
 
-      // If the user gets banned while connected, refresh `/me` to show the banned page.
       try {
         await refreshMe(token)
       } catch {
@@ -213,10 +313,10 @@ export default function ChatPage() {
       socket.disconnect()
       socketRef.current = null
     }
-  }, [token, banned, handleAuthError, navigate, refreshMe, reloadInitial])
+  }, [token, banned, handleAuthError, navigate, refreshMe, reloadInitial, applyIncomingMessages, applyDeletedMessage])
 
   useEffect(() => {
-    if (!token || banned || realtimeMode !== 'polling') return
+    if (!token || banned || realtimeMode !== 'polling') return undefined
 
     let cancelled = false
     let inFlight = false
@@ -244,85 +344,134 @@ export default function ChatPage() {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [token, banned, realtimeMode, handleAuthError, fetchMessages])
+  }, [token, banned, realtimeMode, handleAuthError, fetchMessages, applyIncomingMessages])
 
-  async function deleteMessage(message) {
-    if (!message?.id) return
+  const deleteMessage = useCallback(
+    async (message) => {
+      if (!message?.id || message.pending) return
 
-    setError('')
+      setError('')
 
-    const socket = socketRef.current
-    if (socket?.connected) {
-      const ack = await new Promise((resolve) => {
-        socket.emit('chat:delete', { messageId: message.id }, (res) => resolve(res))
-      })
-      if (!ack?.ok) {
-        setError(ack?.message || 'Delete failed')
+      const socket = socketRef.current
+      if (socket?.connected) {
+        const ack = await new Promise((resolve) => {
+          socket.emit('chat:delete', { messageId: message.id }, (res) => resolve(res))
+        })
+
+        if (!ack?.ok) {
+          setError(ack?.message || 'Delete failed')
+          return
+        }
+
+        applyDeletedMessage(ack?.message)
         return
       }
-      applyDeletedMessage(ack?.message)
-      return
-    }
 
-    try {
-      const res = await apiFetch(`/api/chat/messages/${message.id}`, { method: 'DELETE', token })
-      applyDeletedMessage(res?.message)
-    } catch (err) {
-      if (!handleAuthError(err)) setError(err?.message || 'Delete failed')
-    }
-  }
+      try {
+        const res = await apiFetch(`/api/chat/messages/${message.id}`, {
+          method: 'DELETE',
+          token,
+        })
+        applyDeletedMessage(res?.message)
+      } catch (err) {
+        if (!handleAuthError(err)) setError(err?.message || 'Delete failed')
+      }
+    },
+    [token, handleAuthError, applyDeletedMessage],
+  )
 
-  async function sendMessage() {
+  const handleReply = useCallback((message) => {
+    setReplyTo(message)
+  }, [])
+
+  const handleDelete = useCallback(
+    (message) => {
+      void deleteMessage(message)
+    },
+    [deleteMessage],
+  )
+
+  const sendMessage = useCallback(async () => {
     setError('')
     const trimmed = text.trim()
     if (!trimmed) return
 
-    const replyToId = replyTo?.id || null
+    const originalReplyTo = replyTo
+    const replyToId = originalReplyTo?.id || null
+    const clientRequestId = createClientRequestId()
 
-    // Prefer websocket send so it feels real-time.
+    forceScrollRef.current = true
+    applyIncomingMessages(
+      [
+        buildOptimisticMessage({
+          clientRequestId,
+          text: trimmed,
+          user,
+          replyTo: originalReplyTo,
+        }),
+      ],
+      { forceScroll: true },
+    )
+
+    setText('')
+    setReplyTo(null)
+
     const socket = socketRef.current
     if (socket?.connected) {
-      const payload = { text: trimmed, replyToId }
       try {
         const ack = await new Promise((resolve) => {
-          socket.emit('chat:send', payload, (res) => resolve(res))
+          socket.emit(
+            'chat:send',
+            { text: trimmed, replyToId, clientRequestId },
+            (res) => resolve(res),
+          )
         })
 
         if (!ack?.ok) {
+          removePendingMessage(clientRequestId)
+          restoreComposerOnFailure(trimmed, originalReplyTo)
           setError(ack?.message || 'Failed to send')
           return
         }
 
-        setText('')
-        setReplyTo(null)
+        applyIncomingMessages([ack.message], { forceScroll: true })
       } catch (err) {
+        removePendingMessage(clientRequestId)
+        restoreComposerOnFailure(trimmed, originalReplyTo)
         if (!handleAuthError(err)) setError(err?.message || 'Failed to send')
       }
       return
     }
 
-    // Fallback: REST send if websocket isn't connected.
     try {
-      const body = {
-        text: trimmed,
-        replyToId: replyToId || undefined,
-      }
-
       const res = await apiFetch('/api/chat/messages', {
         method: 'POST',
         token,
-        body,
+        body: {
+          text: trimmed,
+          replyToId: replyToId || undefined,
+          clientRequestId,
+        },
       })
 
-      setText('')
-      setReplyTo(null)
-
-      const created = res.message
-      applyIncomingMessages([created])
+      applyIncomingMessages([res.message], { forceScroll: true })
     } catch (err) {
+      removePendingMessage(clientRequestId)
+      restoreComposerOnFailure(trimmed, originalReplyTo)
       if (!handleAuthError(err)) setError(err?.message || 'Failed to send')
     }
-  }
+  }, [
+    text,
+    replyTo,
+    user,
+    token,
+    handleAuthError,
+    applyIncomingMessages,
+    removePendingMessage,
+    restoreComposerOnFailure,
+  ])
+
+  const canSend = text.trim().length > 0
 
   return (
     <div className="chatShell">
@@ -363,16 +512,16 @@ export default function ChatPage() {
         </div>
       </div>
 
-      <div className="messages" ref={messagesRef}>
+      <div className="messages" ref={messagesRef} onScroll={handleMessagesScroll}>
         <div className="messagesList">
-          {messages.map((m) => (
+          {messages.map((message) => (
             <MessageBubble
-              key={m.id}
-              message={m}
-              isMine={m.senderId === user?.id}
-              canDelete={m.senderId === user?.id || user?.role === 'admin'}
-              onReply={(msg) => setReplyTo(msg)}
-              onDelete={(msg) => deleteMessage(msg)}
+              key={message.id}
+              message={message}
+              isMine={message.senderId === user?.id}
+              canDelete={message.senderId === user?.id || user?.role === 'admin'}
+              onReply={handleReply}
+              onDelete={handleDelete}
             />
           ))}
           <div ref={messagesEndRef} />
@@ -396,18 +545,25 @@ export default function ChatPage() {
 
           <div className="composer">
             <textarea
+              ref={composerRef}
               className="textarea"
+              rows={1}
               value={text}
               placeholder="Type a message..."
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
-                  sendMessage()
+                  void sendMessage()
                 }
               }}
             />
-            <button className="primaryBtn sendBtn" onClick={sendMessage} type="button">
+            <button
+              className="primaryBtn sendBtn"
+              onClick={() => void sendMessage()}
+              type="button"
+              disabled={!canSend}
+            >
               Send
             </button>
           </div>

@@ -1,7 +1,17 @@
-import { useEffect, useState } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../state/useAuth.js'
 import { apiFetch } from '../lib/api.js'
+
+function sortUsers(list) {
+  return [...(list || [])].sort(
+    (a, b) => new Date(b?.createdAt || 0).getTime() - new Date(a?.createdAt || 0).getTime(),
+  )
+}
+
+function upsertUser(list, nextUser) {
+  return sortUsers([nextUser, ...(list || []).filter((user) => user.id !== nextUser.id)])
+}
 
 export default function AdminPage() {
   const navigate = useNavigate()
@@ -9,100 +19,212 @@ export default function AdminPage() {
 
   const [users, setUsers] = useState([])
   const [error, setError] = useState('')
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [busyAction, setBusyAction] = useState('')
+  const [notice, setNotice] = useState('')
 
   const [newUsername, setNewUsername] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [newRole, setNewRole] = useState('user')
+  const [deleteTarget, setDeleteTarget] = useState(null)
+  const [passwordTarget, setPasswordTarget] = useState(null)
+  const [resetPasswordValue, setResetPasswordValue] = useState('')
 
-  async function reloadUsers() {
-    setError('')
+  const stats = useMemo(
+    () => ({
+      total: users.length,
+      active: users.filter((item) => !item.isBanned).length,
+      banned: users.filter((item) => item.isBanned).length,
+    }),
+    [users],
+  )
+
+  const isBusy = Boolean(busyAction)
+
+  const reloadUsers = useCallback(async () => {
     const res = await apiFetch('/api/admin/users', { token })
-    setUsers(res.users || [])
-  }
+    startTransition(() => {
+      setUsers(sortUsers(res.users || []))
+    })
+  }, [token])
+
+  const runAdminAction = useCallback(
+    async ({ actionKey, fallbackMessage, request }) => {
+      setBusyAction(actionKey)
+      setError('')
+
+      try {
+        return await request()
+      } catch (err) {
+        if (!handleAuthError(err)) setError(err?.message || fallbackMessage)
+        return null
+      } finally {
+        setBusyAction('')
+      }
+    },
+    [handleAuthError],
+  )
 
   useEffect(() => {
-    if (!token) return
+    if (!token) return undefined
+
+    let alive = true
+
     ;(async () => {
       try {
         await reloadUsers()
       } catch (err) {
+        if (!alive) return
         if (!handleAuthError(err)) setError(err?.message || 'Failed to load users')
+      } finally {
+        if (alive) setLoading(false)
       }
     })()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token])
 
-  async function onBanToggle(u, banned) {
-    setLoading(true)
-    setError('')
-    try {
-      await apiFetch('/api/admin/ban-user', {
-        method: 'POST',
-        token,
-        body: { userId: u.id, banned },
+    return () => {
+      alive = false
+    }
+  }, [token, reloadUsers, handleAuthError])
+
+  useEffect(() => {
+    if (!notice) return undefined
+
+    const timer = window.setTimeout(() => setNotice(''), 4000)
+    return () => window.clearTimeout(timer)
+  }, [notice])
+
+  const onBanToggle = useCallback(
+    async (targetUser, banned) => {
+      const res = await runAdminAction({
+        actionKey: `ban:${targetUser.id}`,
+        fallbackMessage: 'Ban action failed',
+        request: () =>
+          apiFetch('/api/admin/ban-user', {
+            method: 'POST',
+            token,
+            body: { userId: targetUser.id, banned },
+          }),
       })
-      await reloadUsers()
-    } catch (err) {
-      if (!handleAuthError(err)) setError(err?.message || 'Ban action failed')
-    } finally {
-      setLoading(false)
+
+      if (!res) return
+
+      if (res.user) {
+        startTransition(() => {
+          setUsers((prev) => upsertUser(prev, res.user))
+        })
+      }
+
+      setNotice(res.message || 'User updated successfully')
+    },
+    [runAdminAction, token],
+  )
+
+  const onCreateUser = useCallback(async () => {
+    const username = newUsername.trim()
+    if (username.length < 3) {
+      setError('Username must be at least 3 characters')
+      return
     }
-  }
 
-  async function onDelete(u) {
-    if (!confirm(`Delete user "${u.username}"?`)) return
-    setLoading(true)
-    setError('')
-    try {
-      await apiFetch(`/api/admin/users/${u.id}`, { method: 'DELETE', token })
-      await reloadUsers()
-    } catch (err) {
-      if (!handleAuthError(err)) setError(err?.message || 'Delete failed')
-    } finally {
-      setLoading(false)
+    if (newPassword.length < 6) {
+      setError('Password must be at least 6 characters')
+      return
     }
-  }
 
-  async function onResetPassword(u) {
-    const newPassword = prompt(`Set new password for "${u.username}" (min 6 chars):`)
-    if (!newPassword) return
+    const res = await runAdminAction({
+      actionKey: 'create-user',
+      fallbackMessage: 'Create user failed',
+      request: () =>
+        apiFetch('/api/admin/create-user', {
+          method: 'POST',
+          token,
+          body: { username, password: newPassword, role: newRole },
+        }),
+    })
 
-    setLoading(true)
-    setError('')
-    try {
-      await apiFetch('/api/admin/reset-password', {
-        method: 'POST',
-        token,
-        body: { userId: u.id, newPassword },
+    if (!res) return
+
+    if (res.user) {
+      startTransition(() => {
+        setUsers((prev) => upsertUser(prev, res.user))
       })
-      await reloadUsers()
-    } catch (err) {
-      if (!handleAuthError(err)) setError(err?.message || 'Password reset failed')
-    } finally {
-      setLoading(false)
     }
-  }
 
-  async function onCreateUser() {
-    setLoading(true)
+    setNewUsername('')
+    setNewPassword('')
+    setNewRole('user')
+    setNotice(res.message || 'User created successfully')
+  }, [newPassword, newRole, newUsername, runAdminAction, token])
+
+  const openDeleteModal = useCallback((targetUser) => {
+    setDeleteTarget(targetUser)
+  }, [])
+
+  const closeDeleteModal = useCallback(() => {
+    if (isBusy) return
+    setDeleteTarget(null)
+  }, [isBusy])
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteTarget) return
+
+    const deletedUser = deleteTarget
+    const res = await runAdminAction({
+      actionKey: `delete:${deletedUser.id}`,
+      fallbackMessage: 'Delete failed',
+      request: () =>
+        apiFetch(`/api/admin/users/${deletedUser.id}`, {
+          method: 'DELETE',
+          token,
+        }),
+    })
+
+    if (!res) return
+
+    startTransition(() => {
+      setUsers((prev) => prev.filter((item) => item.id !== deletedUser.id))
+    })
+    setDeleteTarget(null)
+    setNotice(res.message || 'User deleted successfully')
+  }, [deleteTarget, runAdminAction, token])
+
+  const openResetPasswordModal = useCallback((targetUser) => {
+    setPasswordTarget(targetUser)
+    setResetPasswordValue('')
     setError('')
-    try {
-      await apiFetch('/api/admin/create-user', {
-        method: 'POST',
-        token,
-        body: { username: newUsername, password: newPassword, role: newRole },
-      })
-      setNewUsername('')
-      setNewPassword('')
-      setNewRole('user')
-      await reloadUsers()
-    } catch (err) {
-      if (!handleAuthError(err)) setError(err?.message || 'Create user failed')
-    } finally {
-      setLoading(false)
+  }, [])
+
+  const closeResetPasswordModal = useCallback(() => {
+    if (isBusy) return
+    setPasswordTarget(null)
+    setResetPasswordValue('')
+  }, [isBusy])
+
+  const submitPasswordReset = useCallback(async () => {
+    if (!passwordTarget) return
+    if (resetPasswordValue.length < 6) {
+      setError('New password must be at least 6 characters')
+      return
     }
-  }
+
+    const target = passwordTarget
+    const res = await runAdminAction({
+      actionKey: `reset:${target.id}`,
+      fallbackMessage: 'Password reset failed',
+      request: () =>
+        apiFetch('/api/admin/reset-password', {
+          method: 'POST',
+          token,
+          body: { userId: target.id, newPassword: resetPasswordValue },
+        }),
+    })
+
+    if (!res) return
+
+    setPasswordTarget(null)
+    setResetPasswordValue('')
+    setNotice(res.message || 'Password reset completed successfully')
+  }, [passwordTarget, resetPasswordValue, runAdminAction, token])
 
   return (
     <div className="adminShell">
@@ -130,18 +252,26 @@ export default function AdminPage() {
         </div>
       </div>
 
+      {notice ? (
+        <div className="successBox adminSuccessBox" role="status">
+          {notice}
+        </div>
+      ) : null}
+
+      {error ? <div className="errorBox adminErrorBox">{error}</div> : null}
+
       <div className="adminHeroCards">
         <div className="adminHeroCard">
           <span>Total users</span>
-          <strong>{users.length}</strong>
+          <strong>{stats.total}</strong>
         </div>
         <div className="adminHeroCard">
           <span>Active users</span>
-          <strong>{users.filter((u) => !u.isBanned).length}</strong>
+          <strong>{stats.active}</strong>
         </div>
         <div className="adminHeroCard">
           <span>Banned users</span>
-          <strong>{users.filter((u) => u.isBanned).length}</strong>
+          <strong>{stats.banned}</strong>
         </div>
       </div>
 
@@ -166,51 +296,55 @@ export default function AdminPage() {
                 </tr>
               </thead>
               <tbody>
-                {users.map((u) => (
-                  <tr key={u.id}>
+                {users.map((account) => (
+                  <tr key={account.id}>
                     <td data-label="Username">
                       <div className="tableIdentity">
-                        <span className="tableAvatar">{String(u.username || '?').slice(0, 1).toUpperCase()}</span>
+                        <span className="tableAvatar">
+                          {String(account.username || '?').slice(0, 1).toUpperCase()}
+                        </span>
                         <div>
-                          <div className="tablePrimary">{u.username}</div>
+                          <div className="tablePrimary">{account.username}</div>
                           <div className="tableSecondary">User account</div>
                         </div>
                       </div>
                     </td>
                     <td data-label="Role">
-                      <span className={`roleBadge ${u.role === 'admin' ? 'admin' : 'user'}`}>{u.role}</span>
+                      <span className={`roleBadge ${account.role === 'admin' ? 'admin' : 'user'}`}>
+                        {account.role}
+                      </span>
                     </td>
                     <td data-label="Status">
-                      <span className={`statusBadge ${u.isBanned ? 'banned' : 'active'}`}>
-                        {u.isBanned ? 'Banned' : 'Active'}
+                      <span className={`statusBadge ${account.isBanned ? 'banned' : 'active'}`}>
+                        {account.isBanned ? 'Banned' : 'Active'}
                       </span>
                     </td>
                     <td data-label="Created" className="tableDate">
-                      {u.createdAt ? new Date(u.createdAt).toLocaleDateString() : ''}
+                      {account.createdAt ? new Date(account.createdAt).toLocaleDateString() : ''}
                     </td>
                     <td data-label="Actions">
                       <div className="tableActions">
                         <button
                           className="ghostBtn"
                           type="button"
-                          onClick={() => onBanToggle(u, !u.isBanned)}
-                          disabled={loading}
+                          onClick={() => onBanToggle(account, !account.isBanned)}
+                          disabled={isBusy}
                         >
-                          {u.isBanned ? 'Unban' : 'Ban'}
+                          {account.isBanned ? 'Unban' : 'Ban'}
                         </button>
                         <button
                           className="ghostBtn"
                           type="button"
-                          onClick={() => onResetPassword(u)}
-                          disabled={loading}
+                          onClick={() => openResetPasswordModal(account)}
+                          disabled={isBusy}
                         >
                           Reset password
                         </button>
                         <button
                           className="dangerBtn"
                           type="button"
-                          onClick={() => onDelete(u)}
-                          disabled={loading}
+                          onClick={() => openDeleteModal(account)}
+                          disabled={isBusy}
                         >
                           Delete
                         </button>
@@ -218,7 +352,14 @@ export default function AdminPage() {
                     </td>
                   </tr>
                 ))}
-                {!users.length && !error ? (
+                {loading ? (
+                  <tr>
+                    <td colSpan={5} className="tableEmpty">
+                      Loading users...
+                    </td>
+                  </tr>
+                ) : null}
+                {!loading && !users.length && !error ? (
                   <tr>
                     <td colSpan={5} className="tableEmpty">
                       No users yet.
@@ -245,6 +386,7 @@ export default function AdminPage() {
                   value={newUsername}
                   onChange={(e) => setNewUsername(e.target.value)}
                   placeholder="Choose a username"
+                  disabled={isBusy}
                 />
               </div>
               <div className="col adminField">
@@ -254,28 +396,91 @@ export default function AdminPage() {
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   placeholder="Set a secure password"
+                  disabled={isBusy}
                 />
               </div>
               <div className="col adminField">
                 <label>Role</label>
-                <select value={newRole} onChange={(e) => setNewRole(e.target.value)}>
+                <select value={newRole} onChange={(e) => setNewRole(e.target.value)} disabled={isBusy}>
                   <option value="user">User</option>
                   <option value="admin">Admin</option>
                 </select>
               </div>
-              <button className="primaryBtn" onClick={onCreateUser} disabled={loading}>
-                Create
+              <button className="primaryBtn" onClick={() => void onCreateUser()} disabled={isBusy}>
+                {busyAction === 'create-user' ? 'Creating...' : 'Create'}
               </button>
 
-              {error ? <div className="errorBox">{error}</div> : null}
-
               <div className="adminHelperText">
-                Admin can ban/delete users and create accounts for others.
+                Admin can create, ban, delete, and reset access from this panel.
               </div>
             </div>
           </div>
         </div>
       </div>
+
+      {deleteTarget ? (
+        <div className="adminModalBackdrop" onClick={closeDeleteModal}>
+          <div className="adminModal" onClick={(e) => e.stopPropagation()}>
+            <div className="adminModalTitle">Delete user</div>
+            <div className="adminModalBody">
+              This will permanently remove <b>{deleteTarget.username}</b> from the app.
+            </div>
+            <div className="adminModalActions">
+              <button className="ghostBtn" type="button" onClick={closeDeleteModal} disabled={isBusy}>
+                Cancel
+              </button>
+              <button className="dangerBtn" type="button" onClick={() => void confirmDelete()} disabled={isBusy}>
+                {busyAction === `delete:${deleteTarget.id}` ? 'Deleting...' : 'Delete user'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {passwordTarget ? (
+        <div className="adminModalBackdrop" onClick={closeResetPasswordModal}>
+          <div className="adminModal" onClick={(e) => e.stopPropagation()}>
+            <div className="adminModalTitle">Reset password</div>
+            <div className="adminModalBody">
+              Set a new password for <b>{passwordTarget.username}</b>.
+            </div>
+            <div className="col adminField">
+              <label>New password</label>
+              <input
+                type="password"
+                value={resetPasswordValue}
+                onChange={(e) => setResetPasswordValue(e.target.value)}
+                placeholder="Minimum 6 characters"
+                disabled={isBusy}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    void submitPasswordReset()
+                  }
+                }}
+              />
+            </div>
+            <div className="adminModalActions">
+              <button
+                className="ghostBtn"
+                type="button"
+                onClick={closeResetPasswordModal}
+                disabled={isBusy}
+              >
+                Cancel
+              </button>
+              <button
+                className="primaryBtn"
+                type="button"
+                onClick={() => void submitPasswordReset()}
+                disabled={isBusy}
+              >
+                {busyAction === `reset:${passwordTarget.id}` ? 'Resetting...' : 'Reset password'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

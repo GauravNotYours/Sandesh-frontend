@@ -1,20 +1,29 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 
-export default function MessageBubble({ message, isMine, canDelete, onReply, onDelete }) {
+function MessageBubble({ message, isMine, canDelete, onReply, onDelete }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const timerRef = useRef(null)
   const rootRef = useRef(null)
 
   useEffect(() => {
+    if (!menuOpen) return undefined
+
     function onDocClick(e) {
-      if (!menuOpen) return
       const el = rootRef.current
       if (!el) return
       if (!el.contains(e.target)) setMenuOpen(false)
     }
+
     document.addEventListener('mousedown', onDocClick)
     return () => document.removeEventListener('mousedown', onDocClick)
   }, [menuOpen])
+
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current)
+    },
+    [],
+  )
 
   function clearTimer() {
     if (timerRef.current) clearTimeout(timerRef.current)
@@ -22,6 +31,8 @@ export default function MessageBubble({ message, isMine, canDelete, onReply, onD
   }
 
   function startLongPress(e) {
+    if (message?.pending) return
+
     // Right now only open the menu on long press; user clicks "Reply".
     // This matches: "he sees reply option when he long press on that msg".
     if (e.pointerType === 'mouse' && e.button !== 0) return
@@ -42,18 +53,20 @@ export default function MessageBubble({ message, isMine, canDelete, onReply, onD
 
   const showReplyQuote = message?.replyToText && message?.replyToSenderUsername
   const isDeleted = !!message?.isDeleted
+  const isPending = !!message?.pending
 
   return (
     <div
       className={`messageRow ${isMine ? 'mine' : ''}`}
       ref={rootRef}
       onContextMenu={(e) => {
+        if (isPending) return
         e.preventDefault()
         setMenuOpen(true)
       }}
     >
       <div
-        className={`bubble ${isDeleted ? 'deleted' : ''}`}
+        className={`bubble ${isDeleted ? 'deleted' : ''} ${isPending ? 'pending' : ''}`}
         onPointerDown={startLongPress}
         onPointerUp={cancelLongPress}
         onPointerCancel={cancelLongPress}
@@ -61,7 +74,9 @@ export default function MessageBubble({ message, isMine, canDelete, onReply, onD
       >
         <div className="meta">
           <span>{isMine ? 'You' : message.senderUsername}</span>
-          <span>{timeLabel}</span>
+          <span className={`metaStatus ${isPending ? 'pending' : ''}`}>
+            {isPending ? 'Sending...' : timeLabel}
+          </span>
         </div>
 
         {showReplyQuote ? (
@@ -89,7 +104,7 @@ export default function MessageBubble({ message, isMine, canDelete, onReply, onD
             >
               Reply
             </button>
-            {canDelete && !isDeleted ? (
+            {canDelete && !isDeleted && !isPending ? (
               <button
                 type="button"
                 onClick={() => {
@@ -106,3 +121,5 @@ export default function MessageBubble({ message, isMine, canDelete, onReply, onD
     </div>
   )
 }
+
+export default memo(MessageBubble)
