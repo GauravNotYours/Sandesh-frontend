@@ -8,7 +8,8 @@ import { io } from 'socket.io-client'
 const MISSING_SOCKET_API_BASE_MESSAGE =
   'Missing VITE_API_BASE for production. Set it to your deployed backend URL before building the frontend.'
 const MESSAGE_LIMIT = 100
-const POLL_INTERVAL_MS = 3000
+const ACTIVE_POLL_INTERVAL_MS = 1500
+const BACKGROUND_POLL_INTERVAL_MS = 5000
 const SCROLL_BOTTOM_THRESHOLD_PX = 120
 
 function toTimestamp(value) {
@@ -31,6 +32,13 @@ function createClientRequestId() {
   }
 
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function getPollingIntervalMs() {
+  if (typeof document === 'undefined') return ACTIVE_POLL_INTERVAL_MS
+  return document.visibilityState === 'visible'
+    ? ACTIVE_POLL_INTERVAL_MS
+    : BACKGROUND_POLL_INTERVAL_MS
 }
 
 function buildOptimisticMessage({ clientRequestId, text, user, replyTo }) {
@@ -260,6 +268,8 @@ export default function ChatPage() {
       auth: { token },
       transports: ['websocket'],
       reconnectionAttempts: 2,
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 1500,
       timeout: 5000,
     })
 
@@ -320,6 +330,7 @@ export default function ChatPage() {
 
     let cancelled = false
     let inFlight = false
+    let timer = null
 
     async function poll() {
       if (cancelled || inFlight) return
@@ -334,15 +345,17 @@ export default function ChatPage() {
         }
       } finally {
         inFlight = false
+        if (!cancelled) {
+          timer = window.setTimeout(poll, getPollingIntervalMs())
+        }
       }
     }
 
     poll()
-    const timer = window.setInterval(poll, POLL_INTERVAL_MS)
 
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      if (timer) window.clearTimeout(timer)
     }
   }, [token, banned, realtimeMode, handleAuthError, fetchMessages, applyIncomingMessages])
 
@@ -491,7 +504,7 @@ export default function ChatPage() {
                   ? 'Admin session'
                   : realtimeMode === 'websocket'
                     ? 'Live now'
-                    : 'Synced every 3s'}
+                    : 'Fast sync mode'}
               </span>
             </div>
             <button
