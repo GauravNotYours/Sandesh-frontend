@@ -381,7 +381,7 @@ button {
 /* Chat */
 .chatShell {
   --chat-header-height: 74px;
-  --chat-composer-height: 124px;
+  --chat-composer-height: 75px;
   position: fixed;
   inset: 0;
   height: 100svh;
