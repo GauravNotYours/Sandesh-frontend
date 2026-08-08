@@ -42,7 +42,7 @@ export default function LoginPage() {
           <div className="authBadge">Sandesh Messaging</div>
           <h1>Private conversations, clean design, faster teamwork.</h1>
           <p className="authLead">
-            Welcome to Sandesh, a chat app. its a fun project by @GauravNotYours.
+            Welcome to Sandesh, A chat app. its a fun project by @GauravNotYours.
           </p>
           <p className="authLead">
             We don't have any legal rights.
