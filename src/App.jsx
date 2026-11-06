@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { AsciiReveal } from 'ascii-reveal'
 import AuthProvider from './state/AuthContext.jsx'
 import { useAuth } from './state/useAuth.js'
 
@@ -14,7 +15,15 @@ function ProtectedRoute({ children, role }) {
   if (loading) {
     return (
       <div className="page">
-        <div className="card">Loading...</div>
+        <AsciiReveal
+          loading
+          preset="terminal"
+          as="div"
+          className="card"
+          aria-live="polite"
+        >
+          Loading...
+        </AsciiReveal>
       </div>
     )
   }
@@ -24,7 +33,21 @@ function ProtectedRoute({ children, role }) {
 
   if (role && user?.role !== role) return <Navigate to="/chat" replace />
 
-  return children
+  return <RouteReveal>{children}</RouteReveal>
+}
+
+function RouteReveal({ children }) {
+  return (
+    <AsciiReveal
+      preset="decode"
+      duration="fast"
+      lazy={false}
+      as="div"
+      className="routeReveal"
+    >
+      {children}
+    </AsciiReveal>
+  )
 }
 
 function AppRoutes() {
@@ -32,7 +55,7 @@ function AppRoutes() {
     () => (
       <Routes>
         <Route path="/" element={<Navigate to="/chat" replace />} />
-        <Route path="/login" element={<LoginPage />} />
+        <Route path="/login" element={<RouteReveal><LoginPage /></RouteReveal>} />
         <Route
           path="/chat"
           element={
@@ -49,7 +72,7 @@ function AppRoutes() {
             </ProtectedRoute>
           }
         />
-        <Route path="/banned" element={<BannedPage />} />
+        <Route path="/banned" element={<RouteReveal><BannedPage /></RouteReveal>} />
         <Route path="*" element={<Navigate to="/chat" replace />} />
       </Routes>
     ),

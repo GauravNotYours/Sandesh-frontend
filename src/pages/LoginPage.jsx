@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { AsciiReveal } from 'ascii-reveal'
+import AsciiToast from '../components/AsciiToast.jsx'
 import { useAuth } from '../state/useAuth.js'
 
 export default function LoginPage() {
@@ -38,7 +40,7 @@ export default function LoginPage() {
     <div className="authPage">
       <div className="authBackdrop" />
       <div className="authShell">
-        <section className="authWelcome">
+        <AsciiReveal preset="decode" duration="fast" lazy={false} as="section" className="authWelcome">
           <div className="authBadge">Sandesh Messaging</div>
           <h1>Private conversations, clean design, faster teamwork.</h1>
           <p className="authLead">
@@ -53,7 +55,7 @@ export default function LoginPage() {
               <span className="authFeatureDot" />
               <div>
                 <strong>Real-time chat</strong>
-                <p>New messages arrive instantly and stay anchored to the latest conversation.</p>
+                <p>New messages arrive instantly and stay anchored  to the latest conversation.</p>
               </div>
             </div>
             <div className="authFeatureItem">
@@ -73,9 +75,9 @@ export default function LoginPage() {
           </div>
 
           
-        </section>
+        </AsciiReveal>
 
-        <section className="authPanel card">
+        <AsciiReveal preset="decode" duration="fast" lazy={false} as="section" className="authPanel card">
           <div className="authPanelTop">
             <h2>Sign in to continue</h2>
             <p>Enter your Sandesh account details to open your conversations.</p>
@@ -113,10 +115,9 @@ export default function LoginPage() {
             </button>
           </form>
 
-          {error ? <div className="errorBox">{error}</div> : null}
-        </section>
+        </AsciiReveal>
       </div>
+      <AsciiToast message={error} onDismiss={() => setError('')} />
     </div>
   )
 }
-

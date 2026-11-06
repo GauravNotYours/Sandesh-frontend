@@ -1,9 +1,11 @@
 import { startTransition, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useAuth } from '../state/useAuth.js'
-import { API_BASE, apiFetch } from '../lib/api.js'
-import MessageBubble from '../components/MessageBubble.jsx'
+import { AsciiReveal } from 'ascii-reveal'
 import { io } from 'socket.io-client'
+import AsciiToast from '../components/AsciiToast.jsx'
+import MessageBubble from '../components/MessageBubble.jsx'
+import { API_BASE, apiFetch } from '../lib/api.js'
+import { useAuth } from '../state/useAuth.js'
 
 const MISSING_SOCKET_API_BASE_MESSAGE =
   'Missing VITE_API_BASE for production. Set it to your deployed backend URL before building the frontend.'
@@ -13,38 +15,50 @@ const BACKGROUND_POLL_INTERVAL_MS = 5000
 const SCROLL_BOTTOM_THRESHOLD_PX = 120
 
 function toTimestamp(value) {
-  const ms = new Date(value || 0).getTime()
-  return Number.isFinite(ms) ? ms : 0
+  const timestamp = new Date(value || 0).getTime()
+  return Number.isFinite(timestamp) ? timestamp : 0
 }
 
 function isNearBottom(container) {
-  if (!container) return true
-
   return (
+    !container ||
     container.scrollHeight - container.scrollTop - container.clientHeight <=
-    SCROLL_BOTTOM_THRESHOLD_PX
+      SCROLL_BOTTOM_THRESHOLD_PX
   )
 }
 
-function createClientRequestId() {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-}
-
 function getPollingIntervalMs() {
-  if (typeof document === 'undefined') return ACTIVE_POLL_INTERVAL_MS
-  return document.visibilityState === 'visible'
+  return typeof document === 'undefined' || document.visibilityState === 'visible'
     ? ACTIVE_POLL_INTERVAL_MS
     : BACKGROUND_POLL_INTERVAL_MS
 }
 
-function buildOptimisticMessage({ clientRequestId, text, user, replyTo }) {
+function createClientRequestId() {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function sortConversations(list) {
+  return [...list].sort(
+    (first, second) =>
+      toTimestamp(second.lastMessageAt || second.createdAt) -
+      toTimestamp(first.lastMessageAt || first.createdAt),
+  )
+}
+
+function upsertConversation(list, conversation) {
+  return sortConversations([
+    conversation,
+    ...list.filter((item) => item.id !== conversation.id),
+  ])
+}
+
+function buildOptimisticMessage({ clientRequestId, text, user, replyTo, conversationId }) {
   return {
     id: `pending-${clientRequestId}`,
     clientRequestId,
+    conversationId,
     text,
     senderId: user?.id || null,
     senderUsername: user?.username || 'You',
@@ -63,7 +77,6 @@ function mergeMessages(existing, incoming) {
 
   for (const message of incoming || []) {
     if (!message?.id) continue
-
     if (message.clientRequestId) {
       for (const [id, candidate] of merged.entries()) {
         if (candidate?.clientRequestId === message.clientRequestId && id !== message.id) {
@@ -72,35 +85,31 @@ function mergeMessages(existing, incoming) {
       }
     }
 
-    const previous = merged.get(message.id)
     merged.set(message.id, {
-      ...previous,
+      ...merged.get(message.id),
       ...message,
       pending: message.pending ?? false,
     })
   }
 
   return Array.from(merged.values())
-    .sort((a, b) => toTimestamp(a.createdAt) - toTimestamp(b.createdAt))
+    .sort((first, second) => toTimestamp(first.createdAt) - toTimestamp(second.createdAt))
     .slice(-MESSAGE_LIMIT)
 }
 
 function getLatestChangeCursor(messages) {
-  return messages.reduce((latest, message) => {
-    const createdAt = toTimestamp(message.createdAt)
-    const deletedAt = toTimestamp(message.deletedAt)
-    return Math.max(latest, createdAt, deletedAt)
-  }, 0)
+  return messages.reduce(
+    (latest, message) =>
+      Math.max(latest, toTimestamp(message.createdAt), toTimestamp(message.deletedAt)),
+    0,
+  )
 }
 
-function getSocketAuthError(err) {
-  const message = String(err?.message || '').trim()
+function getSocketAuthError(error) {
+  const message = String(error?.message || '').trim()
   const lowered = message.toLowerCase()
-
   if (!message) return null
-  if (lowered.includes('banned')) {
-    return { status: 403, code: 'BANNED', message }
-  }
+  if (lowered.includes('banned')) return { status: 403, code: 'BANNED', message }
   if (
     lowered.includes('missing token') ||
     lowered.includes('invalid token') ||
@@ -109,45 +118,53 @@ function getSocketAuthError(err) {
   ) {
     return { status: 401, message }
   }
-
   return null
 }
 
 export default function ChatPage() {
   const navigate = useNavigate()
   const { token, user, banned, logout, handleAuthError, refreshMe } = useAuth()
+  const currentUserId = user?.id
 
+  const [conversations, setConversations] = useState([])
+  const [activeConversationId, setActiveConversationId] = useState('')
+  const [username, setUsername] = useState('')
   const [messages, setMessages] = useState([])
+  const [unreadByConversation, setUnreadByConversation] = useState({})
+  const [incomingNotice, setIncomingNotice] = useState('')
   const [text, setText] = useState('')
   const [replyTo, setReplyTo] = useState(null)
   const [error, setError] = useState('')
   const [realtimeMode, setRealtimeMode] = useState('polling')
+  const [conversationsLoading, setConversationsLoading] = useState(true)
+  const [messagesLoading, setMessagesLoading] = useState(false)
 
   const messagesRef = useRef(null)
   const messagesEndRef = useRef(null)
   const composerRef = useRef(null)
   const socketRef = useRef(null)
+  const activeConversationIdRef = useRef('')
   const latestCursorRef = useRef(0)
   const shouldStickToBottomRef = useRef(true)
   const forceScrollRef = useRef(true)
 
+  const activeConversation =
+    conversations.find((conversation) => conversation.id === activeConversationId) || null
+
   useLayoutEffect(() => {
     const input = composerRef.current
     if (!input) return
-
     input.style.height = '0px'
     input.style.height = `${Math.min(input.scrollHeight, 132)}px`
   }, [text])
 
   useLayoutEffect(() => {
-    const endEl = messagesEndRef.current
-    if (!endEl || !messages.length) return
+    const endElement = messagesEndRef.current
+    if (!endElement || !messages.length) return
     if (!forceScrollRef.current && !shouldStickToBottomRef.current) return
-
     const behavior = forceScrollRef.current ? 'smooth' : 'auto'
-
     requestAnimationFrame(() => {
-      endEl.scrollIntoView({ block: 'end', behavior })
+      endElement.scrollIntoView({ block: 'end', behavior })
       shouldStickToBottomRef.current = true
       forceScrollRef.current = false
     })
@@ -157,22 +174,56 @@ export default function ChatPage() {
     latestCursorRef.current = getLatestChangeCursor(messages)
   }, [messages])
 
-  useEffect(() => {
-    shouldStickToBottomRef.current = isNearBottom(messagesRef.current)
-  }, [])
+  const loadConversations = useCallback(async () => {
+    const response = await apiFetch('/api/chat/conversations', { token })
+    setConversations(sortConversations(response.conversations || []))
+  }, [token])
 
-  const handleMessagesScroll = useCallback(() => {
-    shouldStickToBottomRef.current = isNearBottom(messagesRef.current)
+  const fetchMessages = useCallback(
+    async (conversationId, sinceMs) => {
+      const query = sinceMs ? `?since=${sinceMs}` : ''
+      const response = await apiFetch(
+        `/api/chat/conversations/${conversationId}/messages${query}`,
+        { token },
+      )
+      return response.messages || []
+    },
+    [token],
+  )
+
+  const applyIncomingMessages = useCallback((incoming, { forceScroll = false } = {}) => {
+    const activeMessages = (incoming || []).filter(
+      (message) => message?.conversationId === activeConversationIdRef.current,
+    )
+    if (!activeMessages.length) return
+    if (forceScroll) forceScrollRef.current = true
+    startTransition(() => {
+      setMessages((previous) => mergeMessages(previous, activeMessages))
+    })
+
+    const conversationMessage = activeMessages[activeMessages.length - 1]
+    setConversations((previous) => {
+      const conversation = previous.find(
+        (item) => item.id === conversationMessage.conversationId,
+      )
+      if (!conversation) return previous
+      return upsertConversation(previous, {
+        ...conversation,
+        lastMessage: conversationMessage,
+        lastMessageAt: conversationMessage.createdAt,
+      })
+    })
   }, [])
 
   const applyDeletedMessage = useCallback((payload) => {
-    if (!payload?.id) return
+    if (!payload?.id || payload.conversationId !== activeConversationIdRef.current) return
 
     startTransition(() => {
-      setMessages((prev) =>
-        mergeMessages(prev, [
+      setMessages((previous) =>
+        mergeMessages(previous, [
           {
             id: payload.id,
+            conversationId: payload.conversationId,
             isDeleted: true,
             deletedAt: payload.deletedAt || null,
             senderUsername: payload.senderUsername || null,
@@ -181,89 +232,121 @@ export default function ChatPage() {
         ]),
       )
     })
-
-    setReplyTo((prev) => (prev?.id === payload.id ? null : prev))
-  }, [])
-
-  const applyIncomingMessages = useCallback((incoming, { forceScroll = false } = {}) => {
-    if (!incoming?.length) return
-    if (forceScroll) forceScrollRef.current = true
-
-    startTransition(() => {
-      setMessages((prev) => mergeMessages(prev, incoming))
-    })
-
-    const deletedIds = new Set(
-      incoming.filter((message) => message?.isDeleted).map((message) => message.id),
+    setConversations((previous) =>
+      previous.map((conversation) =>
+        conversation.id === payload.conversationId &&
+        conversation.lastMessage?.id === payload.id
+          ? {
+              ...conversation,
+              lastMessage: {
+                ...conversation.lastMessage,
+                isDeleted: true,
+                text: '',
+                deletedAt: payload.deletedAt || null,
+              },
+            }
+          : conversation,
+      ),
     )
-    if (deletedIds.size) {
-      setReplyTo((prev) => (prev?.id && deletedIds.has(prev.id) ? null : prev))
-    }
+    setReplyTo((previous) => (previous?.id === payload.id ? null : previous))
   }, [])
-
-  const removePendingMessage = useCallback((clientRequestId) => {
-    if (!clientRequestId) return
-
-    startTransition(() => {
-      setMessages((prev) =>
-        prev.filter((message) => message.clientRequestId !== clientRequestId),
-      )
-    })
-  }, [])
-
-  const restoreComposerOnFailure = useCallback((originalText, originalReplyTo) => {
-    setText((prev) => (prev ? prev : originalText))
-    setReplyTo((prev) => prev ?? originalReplyTo)
-  }, [])
-
-  const fetchMessages = useCallback(
-    async ({ sinceMs } = {}) => {
-      const qs = sinceMs ? `?since=${sinceMs}` : ''
-      const res = await apiFetch(`/api/chat/messages${qs}`, { token })
-      return res.messages || []
-    },
-    [token],
-  )
-
-  const reloadInitial = useCallback(async () => {
-    setError('')
-    const list = await fetchMessages({})
-    forceScrollRef.current = true
-    startTransition(() => {
-      setMessages(list)
-    })
-  }, [fetchMessages])
 
   useEffect(() => {
     if (!token || banned) return undefined
 
     let alive = true
+    setConversationsLoading(true)
+    loadConversations()
+      .catch((loadError) => {
+        if (alive && !handleAuthError(loadError)) {
+          setError(loadError?.message || 'Failed to load conversations')
+        }
+      })
+      .finally(() => {
+        if (alive) setConversationsLoading(false)
+      })
 
-    ;(async () => {
+    return () => {
+      alive = false
+    }
+  }, [token, banned, loadConversations, handleAuthError])
+
+  useEffect(() => {
+    if (!token || banned || realtimeMode !== 'polling') return undefined
+
+    let cancelled = false
+    let timer = null
+
+    async function pollConversations() {
       try {
-        await reloadInitial()
-      } catch (err) {
-        if (!alive) return
-        if (!handleAuthError(err)) setError(err?.message || 'Failed to load messages')
+        await loadConversations()
+      } catch (loadError) {
+        if (!cancelled && !handleAuthError(loadError)) {
+          setError(loadError?.message || 'Failed to sync conversations')
+        }
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(pollConversations, getPollingIntervalMs())
+        }
       }
-    })()
+    }
+
+    timer = window.setTimeout(pollConversations, getPollingIntervalMs())
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [token, banned, realtimeMode, loadConversations, handleAuthError])
+
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId
+    setMessages([])
+    setReplyTo(null)
+    setError('')
+    if (!activeConversationId || !token || banned) {
+      setMessagesLoading(false)
+      return undefined
+    }
+
+    let alive = true
+    setMessagesLoading(true)
+    latestCursorRef.current = 0
+    shouldStickToBottomRef.current = true
+    forceScrollRef.current = true
+    fetchMessages(activeConversationId)
+      .then((list) => {
+        if (alive) {
+          setMessages((previous) => mergeMessages(previous, list))
+        }
+      })
+      .catch((loadError) => {
+        if (alive && !handleAuthError(loadError)) {
+          setError(loadError?.message || 'Failed to load messages')
+        }
+      })
+      .finally(() => {
+        if (alive) setMessagesLoading(false)
+      })
+
+    return () => {
+      alive = false
+    }
+  }, [activeConversationId, token, banned, fetchMessages, handleAuthError])
+
+  useEffect(() => {
+    if (!token || banned) return undefined
 
     if (!API_BASE && import.meta.env.PROD) {
       setRealtimeMode('polling')
       setError(MISSING_SOCKET_API_BASE_MESSAGE)
-      return () => {
-        alive = false
-      }
+      return undefined
     }
-
-    setRealtimeMode(API_BASE ? 'websocket' : 'polling')
-
     if (!API_BASE) {
-      return () => {
-        alive = false
-      }
+      setRealtimeMode('polling')
+      return undefined
     }
 
+    let alive = true
     const socket = io(API_BASE, {
       auth: { token },
       transports: ['websocket'],
@@ -272,49 +355,60 @@ export default function ChatPage() {
       reconnectionDelayMax: 1500,
       timeout: 5000,
     })
-
     socketRef.current = socket
 
     socket.on('connect', () => {
-      if (!alive) return
-      setRealtimeMode('websocket')
+      if (alive) setRealtimeMode('websocket')
     })
-
     socket.on('chat:newMessage', (message) => {
-      applyIncomingMessages([message])
-    })
-
-    socket.on('chat:deleted', (payload) => {
-      applyDeletedMessage(payload)
-    })
-
-    socket.on('connect_error', (err) => {
-      if (!alive) return
-
-      const authError = getSocketAuthError(err)
-      if (authError && handleAuthError(authError)) {
-        if (authError.code === 'BANNED') {
-          navigate('/banned', { replace: true })
+      if (!message?.conversationId) return
+      setConversations((previous) => {
+        let conversation = previous.find((item) => item.id === message.conversationId)
+        if (!conversation) {
+          if (!message.senderId || message.senderId === currentUserId) return previous
+          conversation = {
+            id: message.conversationId,
+            otherUser: { id: message.senderId, username: message.senderUsername },
+            createdAt: message.createdAt,
+          }
         }
+        return upsertConversation(previous, {
+          ...conversation,
+          lastMessage: message,
+          lastMessageAt: message.createdAt,
+        })
+      })
+      if (message.conversationId === activeConversationIdRef.current) {
+        applyIncomingMessages([message])
+      } else if (message.senderId !== currentUserId) {
+        setUnreadByConversation((previous) => ({
+          ...previous,
+          [message.conversationId]: (previous[message.conversationId] || 0) + 1,
+        }))
+        setIncomingNotice(
+          `${message.senderUsername}: ${message.text || 'sent you a message'}`,
+        )
+      }
+    })
+    socket.on('chat:deleted', applyDeletedMessage)
+    socket.on('connect_error', (socketError) => {
+      if (!alive) return
+      const authError = getSocketAuthError(socketError)
+      if (authError && handleAuthError(authError)) {
+        if (authError.code === 'BANNED') navigate('/banned', { replace: true })
         return
       }
-
       setRealtimeMode('polling')
       socket.disconnect()
       socketRef.current = null
     })
-
     socket.on('disconnect', async (reason) => {
       if (!alive) return
-
-      if (reason !== 'io client disconnect') {
-        setRealtimeMode('polling')
-      }
-
+      if (reason !== 'io client disconnect') setRealtimeMode('polling')
       try {
         await refreshMe(token)
       } catch {
-        // ignore
+        // Authentication is checked again by the API requests.
       }
     })
 
@@ -323,10 +417,38 @@ export default function ChatPage() {
       socket.disconnect()
       socketRef.current = null
     }
-  }, [token, banned, handleAuthError, navigate, refreshMe, reloadInitial, applyIncomingMessages, applyDeletedMessage])
+  }, [token, currentUserId, banned, handleAuthError, navigate, refreshMe, applyIncomingMessages, applyDeletedMessage])
 
   useEffect(() => {
-    if (!token || banned || realtimeMode !== 'polling') return undefined
+    const socket = socketRef.current
+    if (!socket || !activeConversationId) return undefined
+
+    const joinConversation = () => {
+      socket.emit('chat:join', { conversationId: activeConversationId }, (response) => {
+        if (
+          !response?.ok &&
+          activeConversationIdRef.current === activeConversationId
+        ) {
+          setError(response?.message || 'Failed to join conversation')
+        }
+      })
+    }
+
+    if (socket.connected) joinConversation()
+    else socket.once('connect', joinConversation)
+
+    return () => {
+      socket.off('connect', joinConversation)
+      if (socket.connected) {
+        socket.emit('chat:leave', { conversationId: activeConversationId })
+      }
+    }
+  }, [activeConversationId, realtimeMode])
+
+  useEffect(() => {
+    if (!token || banned || realtimeMode !== 'polling' || !activeConversationId) {
+      return undefined
+    }
 
     let cancelled = false
     let inFlight = false
@@ -335,160 +457,202 @@ export default function ChatPage() {
     async function poll() {
       if (cancelled || inFlight) return
       inFlight = true
-
       try {
-        const incoming = await fetchMessages({ sinceMs: latestCursorRef.current })
+        const incoming = await fetchMessages(activeConversationId, latestCursorRef.current)
         if (!cancelled) applyIncomingMessages(incoming)
-      } catch (err) {
-        if (!cancelled && !handleAuthError(err)) {
-          setError(err?.message || 'Failed to sync messages')
+      } catch (pollError) {
+        if (!cancelled && !handleAuthError(pollError)) {
+          setError(pollError?.message || 'Failed to sync messages')
         }
       } finally {
         inFlight = false
-        if (!cancelled) {
-          timer = window.setTimeout(poll, getPollingIntervalMs())
-        }
+        if (!cancelled) timer = window.setTimeout(poll, getPollingIntervalMs())
       }
     }
 
     poll()
-
     return () => {
       cancelled = true
       if (timer) window.clearTimeout(timer)
     }
-  }, [token, banned, realtimeMode, handleAuthError, fetchMessages, applyIncomingMessages])
+  }, [
+    token,
+    banned,
+    realtimeMode,
+    activeConversationId,
+    fetchMessages,
+    applyIncomingMessages,
+    handleAuthError,
+  ])
+
+  const selectConversation = useCallback((conversationId) => {
+    activeConversationIdRef.current = conversationId
+    setActiveConversationId(conversationId)
+    if (conversationId) {
+      setUnreadByConversation((previous) => {
+        if (!previous[conversationId]) return previous
+        const next = { ...previous }
+        delete next[conversationId]
+        return next
+      })
+    }
+  }, [])
+
+  const startConversation = useCallback(
+    async (event) => {
+      event.preventDefault()
+      const requestedUsername = username.trim()
+      if (!requestedUsername) return
+      setError('')
+      try {
+        const response = await apiFetch('/api/chat/conversations', {
+          method: 'POST',
+          token,
+          body: { username: requestedUsername },
+        })
+        const conversation = response.conversation
+        setConversations((previous) => upsertConversation(previous, conversation))
+        setUsername('')
+        selectConversation(conversation.id)
+      } catch (requestError) {
+        if (!handleAuthError(requestError)) {
+          setError(requestError?.message || 'Failed to start conversation')
+        }
+      }
+    },
+    [username, token, handleAuthError, selectConversation],
+  )
 
   const deleteMessage = useCallback(
     async (message) => {
-      if (!message?.id || message.pending) return
-
+      if (!message?.id || message.pending || !activeConversationId) return
       setError('')
 
       const socket = socketRef.current
       if (socket?.connected) {
-        const ack = await new Promise((resolve) => {
-          socket.emit('chat:delete', { messageId: message.id }, (res) => resolve(res))
+        const response = await new Promise((resolve) => {
+          socket.emit('chat:delete', { messageId: message.id }, resolve)
         })
-
-        if (!ack?.ok) {
-          setError(ack?.message || 'Delete failed')
+        if (!response?.ok) {
+          setError(response?.message || 'Delete failed')
           return
         }
-
-        applyDeletedMessage(ack?.message)
+        applyDeletedMessage(response.message)
         return
       }
 
       try {
-        const res = await apiFetch(`/api/chat/messages/${message.id}`, {
+        const response = await apiFetch(`/api/chat/messages/${message.id}`, {
           method: 'DELETE',
           token,
         })
-        applyDeletedMessage(res?.message)
-      } catch (err) {
-        if (!handleAuthError(err)) setError(err?.message || 'Delete failed')
+        applyDeletedMessage(response?.message)
+      } catch (requestError) {
+        if (!handleAuthError(requestError)) {
+          setError(requestError?.message || 'Delete failed')
+        }
       }
     },
-    [token, handleAuthError, applyDeletedMessage],
+    [activeConversationId, token, handleAuthError, applyDeletedMessage],
   )
 
-  const handleReply = useCallback((message) => {
-    setReplyTo(message)
-  }, [])
-
-  const handleDelete = useCallback(
-    (message) => {
-      void deleteMessage(message)
-    },
-    [deleteMessage],
-  )
+  const handleReply = useCallback((message) => setReplyTo(message), [])
+  const handleDelete = useCallback((message) => void deleteMessage(message), [deleteMessage])
 
   const sendMessage = useCallback(async () => {
-    setError('')
     const trimmed = text.trim()
-    if (!trimmed) return
+    if (!trimmed || !activeConversationId) return
+    setError('')
 
     const originalReplyTo = replyTo
-    const replyToId = originalReplyTo?.id || null
     const clientRequestId = createClientRequestId()
-
+    const optimisticMessage = buildOptimisticMessage({
+      clientRequestId,
+      text: trimmed,
+      user,
+      replyTo: originalReplyTo,
+      conversationId: activeConversationId,
+    })
     forceScrollRef.current = true
-    applyIncomingMessages(
-      [
-        buildOptimisticMessage({
-          clientRequestId,
-          text: trimmed,
-          user,
-          replyTo: originalReplyTo,
-        }),
-      ],
-      { forceScroll: true },
-    )
-
+    applyIncomingMessages([optimisticMessage], { forceScroll: true })
     setText('')
     setReplyTo(null)
+
+    const restoreComposer = () => {
+      setMessages((previous) =>
+        previous.filter((message) => message.clientRequestId !== clientRequestId),
+      )
+      setText((previous) => previous || trimmed)
+      setReplyTo((previous) => previous || originalReplyTo)
+    }
 
     const socket = socketRef.current
     if (socket?.connected) {
       try {
-        const ack = await new Promise((resolve) => {
+        const response = await new Promise((resolve) => {
           socket.emit(
             'chat:send',
-            { text: trimmed, replyToId, clientRequestId },
-            (res) => resolve(res),
+            {
+              conversationId: activeConversationId,
+              text: trimmed,
+              replyToId: originalReplyTo?.id || undefined,
+              clientRequestId,
+            },
+            resolve,
           )
         })
-
-        if (!ack?.ok) {
-          removePendingMessage(clientRequestId)
-          restoreComposerOnFailure(trimmed, originalReplyTo)
-          setError(ack?.message || 'Failed to send')
+        if (!response?.ok) {
+          restoreComposer()
+          setError(response?.message || 'Failed to send')
           return
         }
-
-        applyIncomingMessages([ack.message], { forceScroll: true })
-      } catch (err) {
-        removePendingMessage(clientRequestId)
-        restoreComposerOnFailure(trimmed, originalReplyTo)
-        if (!handleAuthError(err)) setError(err?.message || 'Failed to send')
+        applyIncomingMessages([response.message], { forceScroll: true })
+      } catch (sendError) {
+        restoreComposer()
+        if (!handleAuthError(sendError)) setError(sendError?.message || 'Failed to send')
       }
       return
     }
 
     try {
-      const res = await apiFetch('/api/chat/messages', {
-        method: 'POST',
-        token,
-        body: {
-          text: trimmed,
-          replyToId: replyToId || undefined,
-          clientRequestId,
+      const response = await apiFetch(
+        `/api/chat/conversations/${activeConversationId}/messages`,
+        {
+          method: 'POST',
+          token,
+          body: {
+            text: trimmed,
+            replyToId: originalReplyTo?.id || undefined,
+            clientRequestId,
+          },
         },
-      })
-
-      applyIncomingMessages([res.message], { forceScroll: true })
-    } catch (err) {
-      removePendingMessage(clientRequestId)
-      restoreComposerOnFailure(trimmed, originalReplyTo)
-      if (!handleAuthError(err)) setError(err?.message || 'Failed to send')
+      )
+      applyIncomingMessages([response.message], { forceScroll: true })
+    } catch (sendError) {
+      restoreComposer()
+      if (!handleAuthError(sendError)) setError(sendError?.message || 'Failed to send')
     }
   }, [
     text,
     replyTo,
+    activeConversationId,
     user,
     token,
     handleAuthError,
     applyIncomingMessages,
-    removePendingMessage,
-    restoreComposerOnFailure,
   ])
 
-  const canSend = text.trim().length > 0
+  const canSend = text.trim().length > 0 && Boolean(activeConversationId)
 
   return (
     <div className="chatShell">
-      <div className="chatHeader">
+      <AsciiReveal
+        preset="decode"
+        duration="fast"
+        lazy={false}
+        as="header"
+        className="chatHeader"
+      >
         <div className="chatHeaderInner">
           <div className="chatHeaderMain">
             <div className="chatHeaderTitle">Sandesh Chat</div>
@@ -507,81 +671,232 @@ export default function ChatPage() {
                     : 'Fast sync mode'}
               </span>
             </div>
+            {user?.role === 'admin' ? (
+              <button className="primaryBtn" onClick={() => navigate('/admin')} type="button">
+                Admin
+              </button>
+            ) : null}
             <button
               className="ghostBtn"
               onClick={() => {
                 logout()
                 navigate('/login', { replace: true })
               }}
+              type="button"
             >
               Logout
             </button>
-            {user?.role === 'admin' ? (
-              <button className="primaryBtn" onClick={() => navigate('/admin')}>
-                Admin
-              </button>
-            ) : null}
           </div>
         </div>
-      </div>
+      </AsciiReveal>
 
-      <div className="messages" ref={messagesRef} onScroll={handleMessagesScroll}>
-        <div className="messagesList">
-          {messages.map((message) => (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              isMine={message.senderId === user?.id}
-              canDelete={message.senderId === user?.id || user?.role === 'admin'}
-              onReply={handleReply}
-              onDelete={handleDelete}
-            />
-          ))}
-          <div ref={messagesEndRef} />
-        </div>
-      </div>
-
-      <div className="composerWrap">
-        <div className="composerInner">
-          {error ? <div className="errorBox chatErrorBox">{error}</div> : null}
-
-          {replyTo ? (
-            <div className="replyBar">
-              <div className="small">
-                Replying to <b>{replyTo.senderUsername}</b>: {replyTo.text.slice(0, 120)}
-              </div>
-              <button className="ghostBtn" onClick={() => setReplyTo(null)} type="button">
-                Cancel
+      <main className="chatContent">
+        <aside className={`conversationSidebar ${activeConversationId ? 'mobileHidden' : ''}`}>
+          <div className="conversationSidebarHeading">
+            <div>
+              <div className="chatHeaderEyebrow">Your inbox</div>
+              <h1>Messages</h1>
+            </div>
+            <span className="conversationCount">{conversations.length}</span>
+          </div>
+          <form className="newConversationForm" onSubmit={startConversation}>
+            <label htmlFor="recipient-username">Message someone by username</label>
+            <div className="newConversationInput">
+              <input
+                id="recipient-username"
+                autoComplete="off"
+                maxLength={30}
+                placeholder="Enter username"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+              />
+              <button className="primaryBtn" disabled={!username.trim()} type="submit">
+                Chat
               </button>
             </div>
-          ) : null}
+          </form>
 
-          <div className="composer">
-            <textarea
-              ref={composerRef}
-              className="textarea"
-              rows={1}
-              value={text}
-              placeholder="Type a message..."
-              onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  void sendMessage()
-                }
-              }}
-            />
-            <button
-              className="primaryBtn sendBtn"
-              onClick={() => void sendMessage()}
-              type="button"
-              disabled={!canSend}
-            >
-              Send
-            </button>
-          </div>
-        </div>
-      </div>
+          <div className="conversationListHeading">Previous chats</div>
+          <AsciiReveal
+            loading={conversationsLoading}
+            preset="terminal"
+            duration="fast"
+            lazy={false}
+            as="div"
+            className="conversationItems"
+          >
+            {conversationsLoading ? (
+              <div className="conversationLoading">Loading conversations...</div>
+            ) : conversations.length ? (
+              conversations.map((conversation) => {
+                const lastMessage = conversation.lastMessage
+                const preview = lastMessage
+                  ? `${lastMessage.senderId === user?.id ? 'You: ' : ''}${lastMessage.isDeleted ? 'Message deleted' : lastMessage.text}`
+                  : 'No messages yet'
+                return (
+                  <AsciiReveal
+                    className={`conversationItem ${activeConversationId === conversation.id ? 'active' : ''}`}
+                    key={conversation.id}
+                    onClick={() => selectConversation(conversation.id)}
+                    preset="decode"
+                    duration="fast"
+                    lazy={false}
+                    as="button"
+                    type="button"
+                  >
+                    <span className="conversationAvatar">
+                      {conversation.otherUser.username.slice(0, 1).toUpperCase()}
+                    </span>
+                    <span className="conversationCopy">
+                      <span className="conversationUsername">
+                        {conversation.otherUser.username}
+                      </span>
+                      <span className="conversationPreview">{preview}</span>
+                    </span>
+                    {unreadByConversation[conversation.id] ? (
+                      <span className="conversationUnread">
+                        {unreadByConversation[conversation.id]}
+                      </span>
+                    ) : null}
+                  </AsciiReveal>
+                )
+              })
+            ) : (
+              <div className="conversationEmpty">
+                No chats yet. Enter a username above to start one.
+              </div>
+            )}
+          </AsciiReveal>
+        </aside>
+
+        <section
+          className={`conversationPanel ${activeConversationId ? 'mobileVisible' : 'mobileHidden'}`}
+          aria-label="Conversation"
+        >
+          {activeConversation ? (
+            <>
+              <div className="conversationToolbar">
+                <button
+                  className="ghostBtn conversationBack"
+                  onClick={() => selectConversation('')}
+                  type="button"
+                >
+                  Back
+                </button>
+                <div className="conversationToolbarIdentity">
+                  <span className="conversationAvatar">
+                    {activeConversation.otherUser.username.slice(0, 1).toUpperCase()}
+                  </span>
+                  <div>
+                    <div className="conversationUsername">
+                      {activeConversation.otherUser.username}
+                    </div>
+                    <div className="conversationToolbarHint">Private conversation</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="messages" ref={messagesRef} onScroll={() => {
+                shouldStickToBottomRef.current = isNearBottom(messagesRef.current)
+              }}>
+                <AsciiReveal
+                  loading={messagesLoading}
+                  preset="terminal"
+                  duration="fast"
+                  lazy={false}
+                  as="div"
+                  className="messagesList"
+                >
+                  {messagesLoading ? (
+                    <div className="conversationLoading">Loading messages...</div>
+                  ) : messages.length ? (
+                    messages.map((message) => (
+                      <AsciiReveal
+                        key={message.id}
+                        preset="decode"
+                        duration="fast"
+                        lazy={false}
+                        as="div"
+                        className="messageReveal"
+                      >
+                        <MessageBubble
+                          message={message}
+                          isMine={message.senderId === user?.id}
+                          canDelete={message.senderId === user?.id || user?.role === 'admin'}
+                          onReply={handleReply}
+                          onDelete={handleDelete}
+                        />
+                      </AsciiReveal>
+                    ))
+                  ) : (
+                    <div className="conversationEmpty messageEmpty">
+                      This is the start of your conversation with{' '}
+                      {activeConversation.otherUser.username}.
+                    </div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </AsciiReveal>
+              </div>
+
+              <div className="composerWrap">
+                <div className="composerInner">
+                  {replyTo ? (
+                    <div className="replyBar">
+                      <div className="small">
+                        Replying to <b>{replyTo.senderUsername}</b>:{' '}
+                        {replyTo.text.slice(0, 120)}
+                      </div>
+                      <button
+                        className="ghostBtn"
+                        onClick={() => setReplyTo(null)}
+                        type="button"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : null}
+                  <div className="composer">
+                    <textarea
+                      ref={composerRef}
+                      className="textarea"
+                      rows={1}
+                      value={text}
+                      placeholder={`Message ${activeConversation.otherUser.username}...`}
+                      onChange={(event) => setText(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && !event.shiftKey) {
+                          event.preventDefault()
+                          void sendMessage()
+                        }
+                      }}
+                    />
+                    <button
+                      className="primaryBtn sendBtn"
+                      disabled={!canSend}
+                      onClick={() => void sendMessage()}
+                      type="button"
+                    >
+                      Send
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="conversationWelcome">
+              <div className="conversationWelcomeIcon">S</div>
+              <h2>Your conversations, one-to-one.</h2>
+              <p>Choose a previous chat or start a new one by username.</p>
+            </div>
+          )}
+        </section>
+      </main>
+      <AsciiToast message={error} onDismiss={() => setError('')} />
+      <AsciiToast
+        message={incomingNotice}
+        kind="message"
+        onDismiss={() => setIncomingNotice('')}
+      />
     </div>
   )
 }

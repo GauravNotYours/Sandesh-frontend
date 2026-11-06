@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom'
+import { AsciiReveal } from 'ascii-reveal'
 import { useAuth } from '../state/useAuth.js'
 
 export default function BannedPage() {
@@ -8,7 +9,13 @@ export default function BannedPage() {
   return (
     <div className="authPage bannedPage">
       <div className="authBackdrop" />
-      <div className="bannedShell">
+      <AsciiReveal
+        preset="decode"
+        duration="fast"
+        lazy={false}
+        as="div"
+        className="bannedShell"
+      >
         <div className="bannedBadge">Access Restricted</div>
         <h1>Account access has been blocked.</h1>
         <p>
@@ -26,8 +33,7 @@ export default function BannedPage() {
             Return to Login
           </button>
         </div>
-      </div>
+      </AsciiReveal>
     </div>
   )
 }
-

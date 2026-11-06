@@ -1,5 +1,7 @@
 import { startTransition, useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { AsciiReveal } from 'ascii-reveal'
+import AsciiToast from '../components/AsciiToast.jsx'
 import { useAuth } from '../state/useAuth.js'
 import { apiFetch } from '../lib/api.js'
 
@@ -258,9 +260,9 @@ export default function AdminPage() {
         </div>
       ) : null}
 
-      {error ? <div className="errorBox adminErrorBox">{error}</div> : null}
+      <AsciiToast message={error} onDismiss={() => setError('')} />
 
-      <div className="adminHeroCards">
+      <AsciiReveal preset="decode" duration="fast" lazy={false} as="div" className="adminHeroCards">
         <div className="adminHeroCard">
           <span>Total users</span>
           <strong>{stats.total}</strong>
@@ -273,9 +275,9 @@ export default function AdminPage() {
           <span>Banned users</span>
           <strong>{stats.banned}</strong>
         </div>
-      </div>
+      </AsciiReveal>
 
-      <div className="adminGrid">
+      <AsciiReveal preset="decode" duration="fast" lazy={false} as="div" className="adminGrid">
         <div>
           <div className="adminSectionHead">
             <div>
@@ -297,7 +299,13 @@ export default function AdminPage() {
               </thead>
               <tbody>
                 {users.map((account) => (
-                  <tr key={account.id}>
+                  <AsciiReveal
+                    key={account.id}
+                    preset="decode"
+                    duration="fast"
+                    lazy={false}
+                    as="tr"
+                  >
                     <td data-label="Username">
                       <div className="tableIdentity">
                         <span className="tableAvatar">
@@ -350,13 +358,20 @@ export default function AdminPage() {
                         </button>
                       </div>
                     </td>
-                  </tr>
+                  </AsciiReveal>
                 ))}
                 {loading ? (
                   <tr>
-                    <td colSpan={5} className="tableEmpty">
+                    <AsciiReveal
+                      loading
+                      preset="terminal"
+                      as="td"
+                      colSpan={5}
+                      className="tableEmpty"
+                      aria-live="polite"
+                    >
                       Loading users...
-                    </td>
+                    </AsciiReveal>
                   </tr>
                 ) : null}
                 {!loading && !users.length && !error ? (
@@ -416,7 +431,7 @@ export default function AdminPage() {
             </div>
           </div>
         </div>
-      </div>
+      </AsciiReveal>
 
       {deleteTarget ? (
         <div className="adminModalBackdrop" onClick={closeDeleteModal}>
