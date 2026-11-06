@@ -88,7 +88,8 @@ The frontend can fall back to polling if Socket.IO is unavailable, but the backe
 
 - New messages are encrypted in the browser with AES-GCM before being sent to the backend.
 - Conversation keys are shared with approved devices using ECDH P-256 and encrypted key envelopes.
-- The first registered device for an account is approved automatically. Later devices remain pending until an approved device approves them and transfers keys.
+- The first registered device for an account is approved automatically. Later devices remain pending until an approved device approves them and transfers keys. The inbox shows pending device IDs and an approval action; on mobile, return to the inbox with Back.
+- A Telegram administrator can list pending devices with `/deviceapproval list`, then approve or reject one device using `/deviceapproval <username> <device-id> approve` or `/deviceapproval <username> <device-id> reject`. Telegram approval resets conversation key IDs; existing encrypted history may become unreadable because the old device keys cannot be recovered.
 - Existing messages that predate encryption remain plaintext and are displayed as before. The backend retains only the encrypted payload for new messages.
 - This implementation does not independently verify peer public keys. A compromised backend could substitute device keys; the current “Encrypted chat” label does not mean keys have been authenticated out of band.
 - Encryption protects message contents in storage and transport from parties without the conversation key. It does not protect against a compromised browser, device, or frontend origin.

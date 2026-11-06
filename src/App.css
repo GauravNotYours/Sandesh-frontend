@@ -608,6 +608,15 @@ button {
   font-size: 12px;
 }
 
+.pendingDeviceId {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
 .pendingDevice .ghostBtn {
   padding: 7px 9px;
   font-size: 11px;

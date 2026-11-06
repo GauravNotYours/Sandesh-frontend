@@ -245,7 +245,7 @@ export default function ChatPage() {
       const devices = response.devices || []
       setDeviceList(devices)
       const currentDevice = devices.find((device) => device.deviceId === currentDeviceId)
-      if (currentDevice) setDeviceStatus(currentDevice.status)
+      setDeviceStatus(currentDevice?.status || 'rejected')
       return devices
     },
     [token],
@@ -371,13 +371,11 @@ export default function ChatPage() {
     const conversationId = activeMessages[0].conversationId
     let decryptedMessages = activeMessages
     if (activeMessages.some((message) => isEncryptedText(message.text))) {
-      let key = conversationKeysRef.current.get(conversationId)?.key
-      if (!key) {
-        try {
-          key = await ensureConversationKey(conversationId)
-        } catch {
-          key = null
-        }
+      let key = null
+      try {
+        key = await ensureConversationKey(conversationId)
+      } catch {
+        key = null
       }
       decryptedMessages = await decryptMessageList(conversationId, activeMessages, key)
     }
@@ -595,7 +593,13 @@ export default function ChatPage() {
     forceScrollRef.current = true
     if (deviceStatus !== 'approved') {
       setMessagesLoading(false)
-      setActiveKeyStatus(deviceStatus === 'pending' ? 'pending' : 'loading')
+      setActiveKeyStatus(
+        deviceStatus === 'pending'
+          ? 'pending'
+          : deviceStatus === 'rejected'
+            ? 'rejected'
+            : 'loading',
+      )
       return undefined
     }
 
@@ -906,9 +910,7 @@ export default function ChatPage() {
 
     let encryptedText
     try {
-      const key =
-        conversationKeysRef.current.get(activeConversationId)?.key ||
-        (await ensureConversationKey(activeConversationId))
+      const key = await ensureConversationKey(activeConversationId)
       encryptedText = await encryptConversationMessage(trimmed, activeConversationId, key)
     } catch (encryptionError) {
       if (!handleAuthError(encryptionError)) {
@@ -996,11 +998,10 @@ export default function ChatPage() {
     ensureConversationKey,
   ])
 
-  const canCompose =
+  const canSend =
+    text.trim().length > 0 &&
     Boolean(activeConversationId) &&
-    deviceStatus === 'approved' &&
-    activeKeyStatus === 'ready'
-  const canSend = text.trim().length > 0 && canCompose
+    deviceStatus === 'approved'
 
   return (
     <div className="chatShell">
@@ -1065,9 +1066,15 @@ export default function ChatPage() {
               as="div"
               className="encryptionNotice"
             >
-              This device is waiting for approval from one of your already approved devices.
-              Encrypted conversations will be available after approval and key transfer.
+              This device is waiting for approval. On a previously approved device, open the
+              inbox and choose “Approve and transfer keys” under Devices awaiting approval.
+              On mobile, use Back to return to the inbox.
             </AsciiReveal>
+          ) : null}
+          {deviceStatus === 'rejected' ? (
+            <div className="encryptionNotice">
+              This device approval was rejected. Sign out and sign in again to request approval.
+            </div>
           ) : null}
           <form className="newConversationForm" onSubmit={startConversation}>
             <label htmlFor="recipient-username">Message someone by username</label>
@@ -1094,7 +1101,10 @@ export default function ChatPage() {
                 .filter((device) => device.status === 'pending')
                 .map((device) => (
                   <div className="pendingDevice" key={device.deviceId}>
-                    <span>New device</span>
+                    <span>
+                      New device
+                      <span className="pendingDeviceId">{device.deviceId}</span>
+                    </span>
                     <button
                       className="ghostBtn"
                       disabled={Boolean(deviceApprovalBusy)}
@@ -1190,6 +1200,8 @@ export default function ChatPage() {
                         ? 'Encrypted chat'
                         : activeKeyStatus === 'pending'
                           ? 'Waiting for device approval'
+                          : activeKeyStatus === 'rejected'
+                            ? 'Device approval rejected'
                           : activeKeyStatus === 'error'
                             ? 'Encryption key unavailable'
                             : 'Setting up encryption...'}
@@ -1264,13 +1276,8 @@ export default function ChatPage() {
                       rows={1}
                       value={text}
                       maxLength={600}
-                      placeholder={
-                        activeKeyStatus === 'ready'
-                          ? `Message ${activeConversation.otherUser.username}...`
-                          : 'Waiting for encryption...'
-                      }
+                      placeholder={`Message ${activeConversation.otherUser.username}...`}
                       onChange={(event) => setText(event.target.value)}
-                      disabled={!canCompose}
                       onKeyDown={(event) => {
                         if (event.key === 'Enter' && !event.shiftKey) {
                           event.preventDefault()
