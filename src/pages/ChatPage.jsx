@@ -5,6 +5,17 @@ import { io } from 'socket.io-client'
 import AsciiToast from '../components/AsciiToast.jsx'
 import MessageBubble from '../components/MessageBubble.jsx'
 import { API_BASE, apiFetch } from '../lib/api.js'
+import {
+  createCryptoId,
+  createConversationKey,
+  decryptConversationKeyEnvelope,
+  decryptConversationMessage,
+  encryptConversationKeyForDevice,
+  encryptConversationMessage,
+  getConversationKey,
+  getOrCreateDeviceIdentity,
+  saveConversationKey,
+} from '../lib/encryption.js'
 import { useAuth } from '../state/useAuth.js'
 
 const MISSING_SOCKET_API_BASE_MESSAGE =
@@ -97,6 +108,20 @@ function mergeMessages(existing, incoming) {
     .slice(-MESSAGE_LIMIT)
 }
 
+function attachReplyPreviews(messages) {
+  const messagesById = new Map(messages.map((message) => [message.id, message]))
+  return messages.map((message) => {
+    if (message.replyToText || !message.replyToMessageId) return message
+    const repliedMessage = messagesById.get(message.replyToMessageId)
+    if (!repliedMessage || repliedMessage.isDeleted || repliedMessage.decryptError) return message
+    return {
+      ...message,
+      replyToText: String(repliedMessage.text || '').slice(0, 160),
+      replyToSenderUsername: repliedMessage.senderUsername,
+    }
+  })
+}
+
 function getLatestChangeCursor(messages) {
   return messages.reduce(
     (latest, message) =>
@@ -121,6 +146,23 @@ function getSocketAuthError(error) {
   return null
 }
 
+async function decryptMessageList(conversationId, messages, key) {
+  const results = await Promise.all(
+    messages.map(async (message) => {
+      try {
+        return await decryptConversationMessage(message, conversationId, key)
+      } catch {
+        return { ...message, text: '[Unable to decrypt this message]', decryptError: true }
+      }
+    }),
+  )
+  return results
+}
+
+function isEncryptedText(text) {
+  return String(text || '').startsWith('e2ee:v1:')
+}
+
 export default function ChatPage() {
   const navigate = useNavigate()
   const { token, user, banned, logout, handleAuthError, refreshMe } = useAuth()
@@ -132,6 +174,11 @@ export default function ChatPage() {
   const [messages, setMessages] = useState([])
   const [unreadByConversation, setUnreadByConversation] = useState({})
   const [incomingNotice, setIncomingNotice] = useState('')
+  const [deviceIdentity, setDeviceIdentity] = useState(null)
+  const [deviceStatus, setDeviceStatus] = useState('registering')
+  const [deviceList, setDeviceList] = useState([])
+  const [deviceApprovalBusy, setDeviceApprovalBusy] = useState('')
+  const [activeKeyStatus, setActiveKeyStatus] = useState('idle')
   const [text, setText] = useState('')
   const [replyTo, setReplyTo] = useState(null)
   const [error, setError] = useState('')
@@ -143,6 +190,7 @@ export default function ChatPage() {
   const messagesEndRef = useRef(null)
   const composerRef = useRef(null)
   const socketRef = useRef(null)
+  const conversationKeysRef = useRef(new Map())
   const activeConversationIdRef = useRef('')
   const latestCursorRef = useRef(0)
   const shouldStickToBottomRef = useRef(true)
@@ -191,17 +239,158 @@ export default function ChatPage() {
     [token],
   )
 
-  const applyIncomingMessages = useCallback((incoming, { forceScroll = false } = {}) => {
+  const refreshDeviceList = useCallback(
+    async (currentDeviceId) => {
+      const response = await apiFetch('/api/crypto/devices', { token })
+      const devices = response.devices || []
+      setDeviceList(devices)
+      const currentDevice = devices.find((device) => device.deviceId === currentDeviceId)
+      if (currentDevice) setDeviceStatus(currentDevice.status)
+      return devices
+    },
+    [token],
+  )
+
+  const ensureConversationKey = useCallback(
+    async (conversationId) => {
+      if (!deviceIdentity || deviceStatus !== 'approved') {
+        throw new Error('Approve this device before opening encrypted conversations')
+      }
+
+      const metadataPath = `/api/chat/conversations/${conversationId}/keys?deviceId=${deviceIdentity.deviceId}`
+      let metadata = await apiFetch(metadataPath, { token })
+      let cached = await getConversationKey(conversationId)
+      let key = cached?.keyId === metadata.keyId ? cached.key : null
+
+      if (!metadata.keyId) {
+        const newKey = await createConversationKey()
+        const keyId = createCryptoId()
+        const claim = await apiFetch(
+          `/api/chat/conversations/${conversationId}/keys/claim`,
+          {
+            method: 'POST',
+            token,
+            body: { deviceId: deviceIdentity.deviceId, keyId },
+          },
+        )
+        if (claim.claimed) {
+          metadata = { ...metadata, keyId: claim.keyId }
+          key = newKey
+          await saveConversationKey(conversationId, claim.keyId, key)
+        } else {
+          for (let attempt = 0; attempt < 12 && !key; attempt += 1) {
+            await new Promise((resolve) => window.setTimeout(resolve, 500))
+            metadata = await apiFetch(metadataPath, { token })
+            cached = await getConversationKey(conversationId)
+            if (cached?.keyId === metadata.keyId) key = cached.key
+            else if (metadata.envelope && metadata.keyId) {
+              key = await decryptConversationKeyEnvelope(
+                metadata.envelope,
+                deviceIdentity,
+                conversationId,
+                deviceIdentity.deviceId,
+              )
+              await saveConversationKey(conversationId, metadata.keyId, key)
+            }
+          }
+        }
+      } else if (!key && metadata.envelope) {
+        key = await decryptConversationKeyEnvelope(
+          metadata.envelope,
+          deviceIdentity,
+          conversationId,
+          deviceIdentity.deviceId,
+        )
+        await saveConversationKey(conversationId, metadata.keyId, key)
+      }
+
+      if (!key && metadata.keyId) {
+        for (let attempt = 0; attempt < 12 && !key; attempt += 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, 500))
+          metadata = await apiFetch(metadataPath, { token })
+          cached = await getConversationKey(conversationId)
+          if (cached?.keyId === metadata.keyId) key = cached.key
+          else if (metadata.envelope) {
+            key = await decryptConversationKeyEnvelope(
+              metadata.envelope,
+              deviceIdentity,
+              conversationId,
+              deviceIdentity.deviceId,
+            )
+            await saveConversationKey(conversationId, metadata.keyId, key)
+          }
+        }
+      }
+
+      if (!key || !metadata.keyId) {
+        throw new Error(
+          'This device has no conversation key yet. Approve it from one of your other devices.',
+        )
+      }
+
+      conversationKeysRef.current.set(conversationId, {
+        keyId: metadata.keyId,
+        key,
+      })
+
+      const envelopeDeviceIds = new Set(metadata.envelopeDeviceIds || [])
+      for (const targetDevice of metadata.devices || []) {
+        if (envelopeDeviceIds.has(targetDevice.deviceId)) continue
+        const envelope = await encryptConversationKeyForDevice(
+          key,
+          conversationId,
+          metadata.keyId,
+          targetDevice,
+        )
+        await apiFetch(
+          `/api/chat/conversations/${conversationId}/keys/envelopes`,
+          {
+            method: 'POST',
+            token,
+            body: {
+              sourceDeviceId: deviceIdentity.deviceId,
+              targetDeviceId: targetDevice.deviceId,
+              keyId: metadata.keyId,
+              ...envelope,
+            },
+          },
+        )
+      }
+
+      return key
+    },
+    [deviceIdentity, deviceStatus, token],
+  )
+
+  const applyIncomingMessages = useCallback(async (incoming, { forceScroll = false } = {}) => {
     const activeMessages = (incoming || []).filter(
       (message) => message?.conversationId === activeConversationIdRef.current,
     )
     if (!activeMessages.length) return
+
+    const conversationId = activeMessages[0].conversationId
+    let decryptedMessages = activeMessages
+    if (activeMessages.some((message) => isEncryptedText(message.text))) {
+      let key = conversationKeysRef.current.get(conversationId)?.key
+      if (!key) {
+        try {
+          key = await ensureConversationKey(conversationId)
+        } catch {
+          key = null
+        }
+      }
+      decryptedMessages = await decryptMessageList(conversationId, activeMessages, key)
+    }
+    if (conversationId !== activeConversationIdRef.current) return
+
     if (forceScroll) forceScrollRef.current = true
     startTransition(() => {
-      setMessages((previous) => mergeMessages(previous, activeMessages))
+      setMessages((previous) =>
+        attachReplyPreviews(mergeMessages(previous, decryptedMessages)),
+      )
     })
 
-    const conversationMessage = activeMessages[activeMessages.length - 1]
+    const conversationMessage = decryptedMessages[decryptedMessages.length - 1]
     setConversations((previous) => {
       const conversation = previous.find(
         (item) => item.id === conversationMessage.conversationId,
@@ -213,7 +402,7 @@ export default function ChatPage() {
         lastMessageAt: conversationMessage.createdAt,
       })
     })
-  }, [])
+  }, [ensureConversationKey])
 
   const applyDeletedMessage = useCallback((payload) => {
     if (!payload?.id || payload.conversationId !== activeConversationIdRef.current) return
@@ -251,6 +440,41 @@ export default function ChatPage() {
     setReplyTo((previous) => (previous?.id === payload.id ? null : previous))
   }, [])
 
+  const approveDevice = useCallback(
+    async (deviceId) => {
+      if (!deviceIdentity || deviceStatus !== 'approved') return
+      setDeviceApprovalBusy(deviceId)
+      setError('')
+      try {
+        await apiFetch(`/api/crypto/devices/${deviceId}/approve`, {
+          method: 'POST',
+          token,
+          body: { sourceDeviceId: deviceIdentity.deviceId },
+        })
+        await refreshDeviceList(deviceIdentity.deviceId)
+        for (const conversation of conversations) {
+          await ensureConversationKey(conversation.id)
+        }
+        setIncomingNotice('Device approved and conversation keys transferred')
+      } catch (approvalError) {
+        if (!handleAuthError(approvalError)) {
+          setError(approvalError?.message || 'Could not approve this device')
+        }
+      } finally {
+        setDeviceApprovalBusy('')
+      }
+    },
+    [
+      deviceIdentity,
+      deviceStatus,
+      token,
+      conversations,
+      refreshDeviceList,
+      ensureConversationKey,
+      handleAuthError,
+    ],
+  )
+
   useEffect(() => {
     if (!token || banned) return undefined
 
@@ -270,6 +494,61 @@ export default function ChatPage() {
       alive = false
     }
   }, [token, banned, loadConversations, handleAuthError])
+
+  useEffect(() => {
+    if (!token || banned) return undefined
+
+    let alive = true
+    ;(async () => {
+      try {
+        const identity = await getOrCreateDeviceIdentity()
+        const response = await apiFetch('/api/crypto/devices/register', {
+          method: 'POST',
+          token,
+          body: {
+            deviceId: identity.deviceId,
+            publicKeyJwk: identity.publicKeyJwk,
+          },
+        })
+        if (!alive) return
+        setDeviceIdentity(identity)
+        setDeviceStatus(response.approved ? 'approved' : 'pending')
+        await refreshDeviceList(identity.deviceId)
+      } catch (deviceError) {
+        if (alive && !handleAuthError(deviceError)) {
+          setDeviceStatus('error')
+          setError(deviceError?.message || 'Could not set up secure messaging on this device')
+        }
+      }
+    })()
+
+    return () => {
+      alive = false
+    }
+  }, [token, banned, refreshDeviceList, handleAuthError])
+
+  useEffect(() => {
+    if (!token || banned || !deviceIdentity) return undefined
+
+    let cancelled = false
+    let timer = null
+    async function refresh() {
+      try {
+        await refreshDeviceList(deviceIdentity.deviceId)
+      } catch (deviceError) {
+        if (!cancelled && !handleAuthError(deviceError)) {
+          setError(deviceError?.message || 'Could not refresh encryption devices')
+        }
+      } finally {
+        if (!cancelled) timer = window.setTimeout(refresh, 4000)
+      }
+    }
+    timer = window.setTimeout(refresh, 4000)
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [token, banned, deviceIdentity, refreshDeviceList, handleAuthError])
 
   useEffect(() => {
     if (!token || banned || realtimeMode !== 'polling') return undefined
@@ -305,6 +584,7 @@ export default function ChatPage() {
     setError('')
     if (!activeConversationId || !token || banned) {
       setMessagesLoading(false)
+      setActiveKeyStatus('idle')
       return undefined
     }
 
@@ -313,14 +593,27 @@ export default function ChatPage() {
     latestCursorRef.current = 0
     shouldStickToBottomRef.current = true
     forceScrollRef.current = true
-    fetchMessages(activeConversationId)
+    if (deviceStatus !== 'approved') {
+      setMessagesLoading(false)
+      setActiveKeyStatus(deviceStatus === 'pending' ? 'pending' : 'loading')
+      return undefined
+    }
+
+    setActiveKeyStatus('loading')
+    ensureConversationKey(activeConversationId)
+      .then(async (key) => {
+        const list = await fetchMessages(activeConversationId)
+        return decryptMessageList(activeConversationId, list, key)
+      })
       .then((list) => {
         if (alive) {
-          setMessages((previous) => mergeMessages(previous, list))
+          setMessages((previous) => attachReplyPreviews(mergeMessages(previous, list)))
+          setActiveKeyStatus('ready')
         }
       })
       .catch((loadError) => {
         if (alive && !handleAuthError(loadError)) {
+          setActiveKeyStatus('error')
           setError(loadError?.message || 'Failed to load messages')
         }
       })
@@ -331,7 +624,54 @@ export default function ChatPage() {
     return () => {
       alive = false
     }
-  }, [activeConversationId, token, banned, fetchMessages, handleAuthError])
+  }, [
+    activeConversationId,
+    token,
+    banned,
+    deviceStatus,
+    fetchMessages,
+    ensureConversationKey,
+    handleAuthError,
+  ])
+
+  useEffect(() => {
+    if (
+      !activeConversationId ||
+      deviceStatus !== 'approved' ||
+      activeKeyStatus !== 'error'
+    ) {
+      return undefined
+    }
+
+    let cancelled = false
+    let timer = null
+    async function retryKeySetup() {
+      try {
+        const key = await ensureConversationKey(activeConversationId)
+        const list = await fetchMessages(activeConversationId)
+        const decrypted = await decryptMessageList(activeConversationId, list, key)
+        if (cancelled) return
+        setMessages((previous) =>
+          attachReplyPreviews(mergeMessages(previous, decrypted)),
+        )
+        setActiveKeyStatus('ready')
+      } catch {
+        if (!cancelled) timer = window.setTimeout(retryKeySetup, 5000)
+      }
+    }
+
+    timer = window.setTimeout(retryKeySetup, 5000)
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [
+    activeConversationId,
+    deviceStatus,
+    activeKeyStatus,
+    ensureConversationKey,
+    fetchMessages,
+  ])
 
   useEffect(() => {
     if (!token || banned) return undefined
@@ -386,7 +726,7 @@ export default function ChatPage() {
           [message.conversationId]: (previous[message.conversationId] || 0) + 1,
         }))
         setIncomingNotice(
-          `${message.senderUsername}: ${message.text || 'sent you a message'}`,
+            `${message.senderUsername}: ${isEncryptedText(message.text) ? 'sent you an encrypted message' : message.text || 'sent you a message'}`,
         )
       }
     })
@@ -564,6 +904,19 @@ export default function ChatPage() {
     if (!trimmed || !activeConversationId) return
     setError('')
 
+    let encryptedText
+    try {
+      const key =
+        conversationKeysRef.current.get(activeConversationId)?.key ||
+        (await ensureConversationKey(activeConversationId))
+      encryptedText = await encryptConversationMessage(trimmed, activeConversationId, key)
+    } catch (encryptionError) {
+      if (!handleAuthError(encryptionError)) {
+        setError(encryptionError?.message || 'Could not encrypt this message')
+      }
+      return
+    }
+
     const originalReplyTo = replyTo
     const clientRequestId = createClientRequestId()
     const optimisticMessage = buildOptimisticMessage({
@@ -594,7 +947,7 @@ export default function ChatPage() {
             'chat:send',
             {
               conversationId: activeConversationId,
-              text: trimmed,
+              text: encryptedText,
               replyToId: originalReplyTo?.id || undefined,
               clientRequestId,
             },
@@ -621,7 +974,7 @@ export default function ChatPage() {
           method: 'POST',
           token,
           body: {
-            text: trimmed,
+            text: encryptedText,
             replyToId: originalReplyTo?.id || undefined,
             clientRequestId,
           },
@@ -640,9 +993,14 @@ export default function ChatPage() {
     token,
     handleAuthError,
     applyIncomingMessages,
+    ensureConversationKey,
   ])
 
-  const canSend = text.trim().length > 0 && Boolean(activeConversationId)
+  const canCompose =
+    Boolean(activeConversationId) &&
+    deviceStatus === 'approved' &&
+    activeKeyStatus === 'ready'
+  const canSend = text.trim().length > 0 && canCompose
 
   return (
     <div className="chatShell">
@@ -699,6 +1057,18 @@ export default function ChatPage() {
             </div>
             <span className="conversationCount">{conversations.length}</span>
           </div>
+          {deviceStatus === 'pending' ? (
+            <AsciiReveal
+              preset="decode"
+              duration="fast"
+              lazy={false}
+              as="div"
+              className="encryptionNotice"
+            >
+              This device is waiting for approval from one of your already approved devices.
+              Encrypted conversations will be available after approval and key transfer.
+            </AsciiReveal>
+          ) : null}
           <form className="newConversationForm" onSubmit={startConversation}>
             <label htmlFor="recipient-username">Message someone by username</label>
             <div className="newConversationInput">
@@ -716,6 +1086,30 @@ export default function ChatPage() {
             </div>
           </form>
 
+          {deviceStatus === 'approved' &&
+          deviceList.some((device) => device.status === 'pending') ? (
+            <div className="pendingDevices">
+              <div className="conversationListHeading">Devices awaiting approval</div>
+              {deviceList
+                .filter((device) => device.status === 'pending')
+                .map((device) => (
+                  <div className="pendingDevice" key={device.deviceId}>
+                    <span>New device</span>
+                    <button
+                      className="ghostBtn"
+                      disabled={Boolean(deviceApprovalBusy)}
+                      onClick={() => void approveDevice(device.deviceId)}
+                      type="button"
+                    >
+                      {deviceApprovalBusy === device.deviceId
+                        ? 'Transferring...'
+                        : 'Approve and transfer keys'}
+                    </button>
+                  </div>
+                ))}
+            </div>
+          ) : null}
+
           <div className="conversationListHeading">Previous chats</div>
           <AsciiReveal
             loading={conversationsLoading}
@@ -731,7 +1125,7 @@ export default function ChatPage() {
               conversations.map((conversation) => {
                 const lastMessage = conversation.lastMessage
                 const preview = lastMessage
-                  ? `${lastMessage.senderId === user?.id ? 'You: ' : ''}${lastMessage.isDeleted ? 'Message deleted' : lastMessage.text}`
+                  ? `${lastMessage.senderId === user?.id ? 'You: ' : ''}${lastMessage.isDeleted ? 'Message deleted' : isEncryptedText(lastMessage.text) ? 'Encrypted message' : lastMessage.text}`
                   : 'No messages yet'
                 return (
                   <AsciiReveal
@@ -791,7 +1185,15 @@ export default function ChatPage() {
                     <div className="conversationUsername">
                       {activeConversation.otherUser.username}
                     </div>
-                    <div className="conversationToolbarHint">Private conversation</div>
+                    <div className="conversationToolbarHint">
+                      {activeKeyStatus === 'ready'
+                        ? 'Encrypted chat'
+                        : activeKeyStatus === 'pending'
+                          ? 'Waiting for device approval'
+                          : activeKeyStatus === 'error'
+                            ? 'Encryption key unavailable'
+                            : 'Setting up encryption...'}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -861,8 +1263,14 @@ export default function ChatPage() {
                       className="textarea"
                       rows={1}
                       value={text}
-                      placeholder={`Message ${activeConversation.otherUser.username}...`}
+                      maxLength={600}
+                      placeholder={
+                        activeKeyStatus === 'ready'
+                          ? `Message ${activeConversation.otherUser.username}...`
+                          : 'Waiting for encryption...'
+                      }
                       onChange={(event) => setText(event.target.value)}
+                      disabled={!canCompose}
                       onKeyDown={(event) => {
                         if (event.key === 'Enter' && !event.shiftKey) {
                           event.preventDefault()

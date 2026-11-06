@@ -582,6 +582,37 @@ button {
   text-transform: uppercase;
 }
 
+.encryptionNotice {
+  margin: 0 12px 12px;
+  padding: 11px 12px;
+  border: 1px solid rgba(96, 165, 250, 0.24);
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.1);
+  color: #bfdbfe;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pendingDevices {
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.pendingDevice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 12px 10px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.pendingDevice .ghostBtn {
+  padding: 7px 9px;
+  font-size: 11px;
+}
+
 .conversationItems {
   min-height: 0;
   flex: 1;

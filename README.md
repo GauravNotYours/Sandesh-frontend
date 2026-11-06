@@ -1,66 +1,103 @@
-# Sandesh Frontend Summary
+# Sandesh — Frontend
 
-This README explains how the frontend is built at a high level.
-Sensitive values such as live backend URLs, tokens, and private deployment details are intentionally not included.
+The Sandesh frontend is a standalone React single-page application. It is deployed independently from the backend (for example, on Vercel) and communicates with the backend over HTTP and Socket.IO.
 
-## What this frontend is
+## Features
 
-The frontend is a React single-page app built with Vite. It provides the user-facing parts of the chat product:
+- Username/password login, authenticated routes, logout, and banned-account handling.
+- One-to-one conversations started by username, with inbox history and unread indicators.
+- Live message delivery with Socket.IO and HTTP polling fallback.
+- Replies, message deletion, optimistic message sending, and ASCII reveal/animated notifications.
+- Responsive layouts for desktop, tablet, and mobile.
+- Client-side encryption for new conversation messages, with device approval and key transfer.
+- Admin tools for managing users (available to authorized administrators).
 
-- login screen
-- chat screen
-- admin screen
-- banned-access screen
+## Technology
 
-## Main stack
+- React 19, React Router, and Vite.
+- `socket.io-client` for realtime messaging.
+- `ascii-reveal` for content transitions and notifications.
+- Web Crypto API and IndexedDB for encryption keys.
+- Vercel Analytics.
 
-- React 19
-- Vite
-- React Router
-- `socket.io-client`
-- Vercel Analytics
-- plain CSS files for styling
+## Project layout
 
-## How the frontend is organized
+```text
+src/
+  components/   Reusable message and toast components
+  lib/          API client and browser encryption helpers
+  pages/        Login, chat, admin, and banned-account screens
+  state/        Authentication context and hooks
+  App.jsx       Browser routes and access control
+  App.css       Application and responsive styles
+  main.jsx      React entry point
+```
 
-- `src/main.jsx` starts the React app and analytics.
-- `src/App.jsx` defines the route tree and wraps the app with auth state.
-- `src/state/AuthContext.jsx` manages token storage, current-user loading, logout, and banned-user handling.
-- `src/lib/api.js` centralizes API requests and resolves the backend base URL.
-- `src/pages/LoginPage.jsx` handles sign-in.
-- `src/pages/ChatPage.jsx` handles message loading, sending, replying, deleting, and live updates.
-- `src/pages/AdminPage.jsx` handles admin-only account actions.
-- `src/pages/BannedPage.jsx` shows the blocked account state.
-- `src/components/MessageBubble.jsx` renders each message bubble and its quick actions.
+## Requirements
 
-## How it works
+- Node.js `^20.19.0` or `>=22.12.0` (Node 22 is selected by `.nvmrc`).
+- npm.
+- A running Sandesh backend. See the backend project's own README for its setup and deployment.
 
-1. The app runs as a SPA and uses browser routing for `/login`, `/chat`, `/admin`, and `/banned`.
-2. After login, the auth token is stored in browser storage and reused for authenticated API requests.
-3. Private pages are protected in the router, and the admin page is additionally gated by user role.
-4. The chat page first loads messages over HTTP, then tries to keep the UI live with Socket.IO.
-5. If live sockets are not available, the frontend falls back to polling the backend.
-6. Message sending uses optimistic UI so the user sees feedback before the server response fully returns.
-7. The admin page uses backend APIs for account creation, banning, deletion, and password reset.
+## Local development
 
-## UI and styling approach
+From this directory:
 
-- Most of the product styling lives in `src/App.css`.
-- The design is a custom dark interface rather than a UI component framework.
-- The chat view uses a fixed header, scrollable message area, and fixed composer.
-- The admin area is responsive and collapses into mobile-friendly stacked layouts on smaller screens.
+```sh
+npm ci
+npm run dev
+```
 
-## How it connects to the backend
+Vite uses `http://localhost:3001` as the development backend default. To use another backend, set `VITE_API_BASE` in a local `.env.local` file:
 
-- The frontend sends requests to `/api/*` endpoints through a configured backend base URL.
-- Authenticated requests include a bearer token.
-- Real-time updates use Socket.IO when available and gracefully fall back to polling when not.
+```env
+VITE_API_BASE=http://localhost:3001
+```
 
-## Sensitive information
+Set the value to the backend origin only (for example, `https://your-backend.example.com`); the frontend adds `/api` to API paths. A trailing `/api` is also accepted and normalized. Do not put credentials or secrets in a `VITE_*` variable: Vite embeds these values in the public client bundle.
 
-This README intentionally does not include:
+Useful commands:
 
-- live API URLs
-- tokens
-- passwords
-- private deployment origins
+```sh
+npm run dev       # Start the Vite development server
+npm run lint      # Run ESLint
+npm run build     # Create the production build in dist/
+npm run preview   # Preview the production build locally
+```
+
+## Configuration and deployment
+
+Deploy this directory as its own Vercel project:
+
+1. Use this folder as the project root.
+2. Set the build command to `npm run build` and the output directory to `dist`.
+3. Configure `VITE_API_BASE` in the Vercel project's environment variables to the backend's public origin.
+4. Redeploy after changing the environment variable; Vite reads it at build time.
+
+`vercel.json` rewrites browser routes to `index.html`, so routes such as `/chat` and `/admin` work on refresh. The backend must allow the deployed frontend origin through its CORS configuration. Use HTTPS for hosted deployments; Web Crypto requires a secure context (localhost is also treated as secure by browsers).
+
+The frontend can fall back to polling if Socket.IO is unavailable, but the backend must still be reachable for API requests. A missing `VITE_API_BASE` in a hosted production build is an error and should be corrected in Vercel configuration.
+
+## Authentication and browser storage
+
+- The JWT is kept in browser `localStorage` under `sandesh_token` and sent as a bearer token to protected API routes.
+- The device identity and non-exportable ECDH private key, plus conversation keys, are stored in IndexedDB for the current browser profile.
+- Clearing site data, changing browser profiles, or losing the device's IndexedDB keys can prevent access to encrypted conversations. An additional device must be approved and receive key envelopes from an already approved device.
+
+## Encryption behavior and limitations
+
+- New messages are encrypted in the browser with AES-GCM before being sent to the backend.
+- Conversation keys are shared with approved devices using ECDH P-256 and encrypted key envelopes.
+- The first registered device for an account is approved automatically. Later devices remain pending until an approved device approves them and transfers keys.
+- Existing messages that predate encryption remain plaintext and are displayed as before. The backend retains only the encrypted payload for new messages.
+- This implementation does not independently verify peer public keys. A compromised backend could substitute device keys; the current “Encrypted chat” label does not mean keys have been authenticated out of band.
+- Encryption protects message contents in storage and transport from parties without the conversation key. It does not protect against a compromised browser, device, or frontend origin.
+
+## Main frontend behavior
+
+- `src/lib/api.js` centralizes requests and resolves `VITE_API_BASE`.
+- `src/state/AuthContext.jsx` handles session restoration, login, logout, and auth failures.
+- `src/pages/ChatPage.jsx` handles conversations, message history, realtime updates, encryption, device approval, and composer state.
+- `src/lib/encryption.js` implements browser key persistence, message encryption/decryption, and key envelopes.
+- `src/pages/AdminPage.jsx` provides the administrator interface.
+- `src/components/AsciiToast.jsx` displays animated errors and incoming-message notices.
