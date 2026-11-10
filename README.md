@@ -102,3 +102,5 @@ The frontend can fall back to polling if Socket.IO is unavailable, but the backe
 - `src/lib/encryption.js` implements browser key persistence, message encryption/decryption, and key envelopes.
 - `src/pages/AdminPage.jsx` provides the administrator interface.
 - `src/components/AsciiToast.jsx` displays animated errors and incoming-message notices.
+
+- thanks to @quanhoangindex for ascii-reveal repo❤️
